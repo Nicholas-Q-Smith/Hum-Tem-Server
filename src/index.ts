@@ -1,18 +1,23 @@
 import { readFileSync } from 'node:fs';
-import { MINUTE_MS, MinuteAggregator, minuteStart, type MinuteRow } from './aggregator.js';
+import { dirname } from 'node:path';
+import { MINUTE_MS, minuteStart, type MinuteRow } from './aggregator.js';
 import { ConfigError, loadConfig } from './config.js';
 import { createLogger } from './logger.js';
-import { SensorSelector, type Sample } from './sensor.js';
-import { createApiServer, type LiveState } from './server.js';
+import { Recorder } from './recorder.js';
+import { SensorSelector } from './sensors.js';
+import { createApiServer } from './server.js';
 import { NobleSource } from './sources/noble.js';
-import { SimulatedSource, simulatedBattery, simulatedClimate } from './sources/simulate.js';
+import {
+  type SimulatedDevice,
+  SimulatedSource,
+  simulatedBattery,
+  simulatedClimate,
+  simulatedDevices,
+} from './sources/simulate.js';
 import type { AdvertisementSource } from './sources/types.js';
 import { Store } from './store.js';
 
-const STALE_MS = 5 * MINUTE_MS;
 const WATCHDOG_INTERVAL_MS = 30_000;
-/** Before NTP sync a Pi (no RTC) can boot with a clock in the past; don't record then. */
-const MIN_VALID_TS = Date.UTC(2024, 0, 1);
 
 const version = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string })
   .version;
@@ -31,83 +36,80 @@ try {
 const log = createLogger(config.logLevel);
 log.info(`pihumtemp ${version} starting (${config.simulate ? 'SIMULATE' : 'BLE'} mode, db ${config.dbPath})`);
 
-const store = new Store(config.dbPath);
+let store: Store;
+try {
+  store = new Store(config.dbPath);
+} catch (err) {
+  const uid = process.getuid?.();
+  log.error(
+    `Cannot open database ${config.dbPath}: ${String(err)}. ` +
+      `Make sure its directory exists and is writable by uid ${uid}` +
+      ` (e.g. sudo install -d -o ${uid} -g ${uid} ${dirname(config.dbPath)}).`,
+  );
+  process.exit(1);
+}
 const stats = store.stats();
-log.info(`Database has ${stats.readings} minute rows`);
+log.info(`Database has ${stats.readings} minute rows and ${stats.samples} raw samples`);
 
-if (config.simulate && stats.readings === 0 && config.simulateBackfillDays > 0) {
-  store.upsertMany(simulatedHistory(config.simulateBackfillDays));
-  log.info(`Seeded ${store.stats().readings} simulated minute rows (${config.simulateBackfillDays} days, with a gap)`);
+// In simulate mode, unless SENSORS is set, record the fake devices under their rooms.
+const simDevices = config.simulate ? simulatedDevices(config.simulateSensors) : [];
+const specs =
+  config.sensors.length || !config.simulate ? config.sensors : simDevices.map((d) => ({ address: d.address, room: d.room }));
+
+const recorder = new Recorder(store, specs, log);
+const selector = new SensorSelector(specs, recorder.knownIds(), log, config.debug);
+
+if (config.simulate && config.simulateBackfillDays > 0) {
+  simDevices.forEach((device, i) => {
+    const sensor = recorder.resolve(device.address);
+    if (!sensor || store.sensorStats(sensor.record.id).readings > 0) return;
+    store.upsertMany(sensor.record.id, simulatedHistory(device, config.simulateBackfillDays, 2 + i));
+    log.info(`Seeded ${config.simulateBackfillDays} days of simulated history for ${device.room}`);
+  });
 }
 
-const live: LiveState = { latest: null, lastAdvertisement: null };
-
-const aggregator = new MinuteAggregator((row) => {
-  try {
-    store.upsertMinute(row);
-    log.debug(
-      `Stored ${new Date(row.ts).toISOString()}: ${row.tempC.toFixed(2)}°C ${row.humidity.toFixed(1)}% ` +
-        `(${row.samples} samples, battery ${row.battery}%, rssi ${row.rssi})`,
-    );
-  } catch (err) {
-    log.error('Failed to store minute row:', err);
-  }
-});
-
-const selector = new SensorSelector(
-  { address: config.sensorAddress, name: config.sensorName },
-  log,
-  config.debug,
-);
-
-let clockWarned = false;
-function onSample(sample: Sample): void {
-  if (sample.ts < MIN_VALID_TS) {
-    if (!clockWarned) log.warn('System clock looks unset (before 2024); ignoring readings until it is synced');
-    clockWarned = true;
-    return;
-  }
-  clockWarned = false;
-  live.lastAdvertisement = sample.ts;
-  live.latest = {
-    ts: sample.ts,
-    tempC: sample.tempC,
-    humidity: sample.humidity,
-    battery: sample.battery,
-    rssi: sample.rssi,
-  };
-  aggregator.add(sample);
-}
-
-const source: AdvertisementSource = config.simulate ? new SimulatedSource(log) : new NobleSource(log);
+const source: AdvertisementSource = config.simulate ? new SimulatedSource(simDevices, log) : new NobleSource(log);
 
 // Close each minute shortly after it ends, even if no new sample arrives.
 let minuteTimer: NodeJS.Timeout | undefined;
 function scheduleMinuteFlush(): void {
   const now = Date.now();
   minuteTimer = setTimeout(() => {
-    aggregator.flushBefore(Date.now());
+    recorder.flushBefore(Date.now());
     scheduleMinuteFlush();
   }, minuteStart(now) + MINUTE_MS + 1_000 - now);
 }
 
-// Warn (and kick the scanner) if the sensor goes quiet.
-const startedAt = Date.now();
-let lastStaleWarning = 0;
+// Warn about silent sensors; kick the scanner if none is heard at all.
+let lastScanRestart = 0;
 const watchdog = setInterval(() => {
   const now = Date.now();
-  const since = now - (live.lastAdvertisement ?? startedAt);
-  if (since < STALE_MS || now - lastStaleWarning < STALE_MS) return;
-  lastStaleWarning = now;
-  log.warn(
-    `No advertisement from the sensor for ${Math.round(since / MINUTE_MS)} min` +
-      (live.lastAdvertisement ? '' : ' (none since startup)') +
-      '; restarting scan',
-  );
+  if (!recorder.checkStale(now) || now - lastScanRestart < 5 * MINUTE_MS) return;
+  lastScanRestart = now;
+  log.warn('No advertisements from any recorded sensor for 5+ min; restarting scan');
   source.restart().catch((err) => log.error('Scan restart failed:', err));
 }, WATCHDOG_INTERVAL_MS);
 
-const server = createApiServer({ store, live, version, log });
+// Raw-sample retention (minute rows are kept forever).
+const PRUNE_INTERVAL_MS = 3_600_000;
+let pruneTimer: NodeJS.Timeout | undefined;
+if (config.rawRetentionDays > 0) {
+  const prune = () => {
+    try {
+      const n = store.pruneSamples(Date.now() - config.rawRetentionDays * 86_400_000);
+      if (n > 0) log.info(`Pruned ${n} raw samples older than ${config.rawRetentionDays} days`);
+    } catch (err) {
+      log.error('Pruning raw samples failed:', err);
+    }
+  };
+  prune();
+  pruneTimer = setInterval(prune, PRUNE_INTERVAL_MS);
+  log.info(`Keeping raw samples for ${config.rawRetentionDays} days`);
+} else {
+  log.info('Keeping raw samples forever (RAW_RETENTION_DAYS=0)');
+}
+
+const server = createApiServer({ store, recorder, nearby: () => selector.nearby(), version, log });
 server.on('error', (err) => {
   log.error('HTTP server error:', err);
   process.exit(1);
@@ -117,8 +119,8 @@ server.listen(config.port, config.host, () => log.info(`HTTP API listening on ht
 scheduleMinuteFlush();
 source
   .start((adv) => {
-    const sample = selector.handle(adv);
-    if (sample) onSample(sample);
+    const match = selector.handle(adv);
+    if (match) recorder.handle(match);
   })
   .catch((err) => {
     log.error('Failed to start advertisement source:', err);
@@ -131,10 +133,11 @@ async function shutdown(signal: string, code = 0): Promise<void> {
   shuttingDown = true;
   log.info(`${signal} received, shutting down`);
   clearInterval(watchdog);
+  clearInterval(pruneTimer);
   clearTimeout(minuteTimer);
   await source.stop().catch(() => {});
   // The open minute is partial; the upsert merges it with the rest after restart.
-  aggregator.flushAll();
+  recorder.flushAll();
   server.close();
   server.closeAllConnections();
   store.close();
@@ -147,14 +150,14 @@ process.on('uncaughtException', (err) => {
   void shutdown('uncaughtException', 1);
 });
 
-/** Plausible minute rows for the last `days` days, with a 3 h gap two days ago. */
-function* simulatedHistory(days: number): Generator<MinuteRow> {
+/** Plausible minute rows for the last `days` days, with a 3 h gap `gapDaysAgo` days ago. */
+function* simulatedHistory(device: SimulatedDevice, days: number, gapDaysAgo: number): Generator<MinuteRow> {
   const end = minuteStart(Date.now());
-  const gapStart = end - 2 * 86_400_000;
+  const gapStart = end - gapDaysAgo * 86_400_000;
   const gapEnd = gapStart + 3 * 3_600_000;
   for (let ts = end - days * 86_400_000; ts < end; ts += MINUTE_MS) {
     if (ts >= gapStart && ts < gapEnd) continue;
-    const { tempC, humidity } = simulatedClimate(ts, 0.5);
-    yield { ts, tempC, humidity, battery: simulatedBattery(ts), rssi: -62, samples: 30 };
+    const { tempC, humidity } = simulatedClimate(ts, 0.5, device);
+    yield { ts, tempC, humidity, battery: simulatedBattery(ts), rssi: device.rssi, samples: 30 };
   }
 }

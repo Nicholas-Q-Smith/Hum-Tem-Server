@@ -1,23 +1,23 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Logger } from './logger.js';
-import { MAX_POINTS_LIMIT, type Reading, type Store } from './store.js';
-
-/** Live state owned by the recorder, read by the API. */
-export interface LiveState {
-  latest: Reading | null;
-  lastAdvertisement: number | null;
-}
+import type { Recorder, TrackedSensor } from './recorder.js';
+import type { NearbyDevice } from './sensors.js';
+import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type Store } from './store.js';
 
 export interface ApiDeps {
   store: Store;
-  live: LiveState;
+  recorder: Recorder;
+  /** H5075s heard but not recorded. */
+  nearby: () => NearbyDevice[];
   version: string;
   log: Logger;
 }
 
 export const DEFAULT_MAX_POINTS = 1000;
+export const DEFAULT_SAMPLES_LIMIT = 10_000;
 
 export type ReadingsQuery = { from: number; to: number; maxPoints: number };
+export type SamplesQuery = { from: number; to: number; limit: number };
 
 function parseInteger(params: URLSearchParams, name: string): number | undefined | Error {
   const value = params.get(name);
@@ -41,6 +41,19 @@ export function parseReadingsQuery(params: URLSearchParams): ReadingsQuery | { e
   return { from, to, maxPoints: Math.min(MAX_POINTS_LIMIT, Math.max(1, maxPoints ?? DEFAULT_MAX_POINTS)) };
 }
 
+/** Validates /api/samples params; returns an error message for a 400. */
+export function parseSamplesQuery(params: URLSearchParams): SamplesQuery | { error: string } {
+  const from = parseInteger(params, 'from');
+  if (from instanceof Error) return { error: from.message };
+  const to = parseInteger(params, 'to');
+  if (to instanceof Error) return { error: to.message };
+  const limit = parseInteger(params, 'limit');
+  if (limit instanceof Error) return { error: limit.message };
+  if (from === undefined || to === undefined) return { error: 'from and to are required (epoch ms)' };
+  if (from > to) return { error: 'from must be <= to' };
+  return { from, to, limit: Math.min(MAX_SAMPLES_LIMIT, Math.max(1, limit ?? DEFAULT_SAMPLES_LIMIT)) };
+}
+
 function send(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
   const json = JSON.stringify(body);
   res.writeHead(status, {
@@ -51,9 +64,23 @@ function send(req: IncomingMessage, res: ServerResponse, status: number, body: u
   res.end(req.method === 'HEAD' ? undefined : json);
 }
 
-export function createApiServer({ store, live, version, log }: ApiDeps): Server {
+export function createApiServer({ store, recorder, nearby, version, log }: ApiDeps): Server {
   return createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
+    /**
+     * Resolves `?sensor=` (a MAC address; default: the primary sensor). Sends a
+     * 404 for an unknown sensor; returns null when none is known yet.
+     */
+    const sensorParam = (): TrackedSensor | null | false => {
+      const param = url.searchParams.get('sensor');
+      const sensor = recorder.resolve(param);
+      if (sensor) return sensor;
+      if (param !== null && param.trim() !== '') {
+        send(req, res, 404, { error: `unknown sensor: ${param}` });
+        return false;
+      }
+      return null;
+    };
     try {
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         res.setHeader('Allow', 'GET, HEAD');
@@ -68,15 +95,38 @@ export function createApiServer({ store, live, version, log }: ApiDeps): Server 
             readings: stats.readings,
             oldest: stats.oldest,
             newest: stats.newest,
-            lastAdvertisement: live.lastAdvertisement,
+            samples: stats.samples,
+            sensors: recorder.list().length,
+            lastAdvertisement: recorder.lastAdvertisement(),
           });
         }
-        case '/api/latest':
-          return send(req, res, 200, { reading: live.latest ?? store.newest() });
+        case '/api/sensors': {
+          const primaryId = recorder.primary()?.id;
+          return send(req, res, 200, {
+            sensors: recorder.list().map((s) => recorder.summary(s, primaryId)),
+            nearby: nearby(),
+          });
+        }
+        case '/api/latest': {
+          const sensor = sensorParam();
+          if (sensor === false) return;
+          return send(req, res, 200, { reading: sensor ? (sensor.latest ?? store.newest(sensor.record.id)) : null });
+        }
         case '/api/readings': {
           const q = parseReadingsQuery(url.searchParams);
           if ('error' in q) return send(req, res, 400, { error: q.error });
-          return send(req, res, 200, { readings: store.readings(q.from, q.to, q.maxPoints) });
+          const sensor = sensorParam();
+          if (sensor === false) return;
+          return send(req, res, 200, {
+            readings: sensor ? store.readings(sensor.record.id, q.from, q.to, q.maxPoints) : [],
+          });
+        }
+        case '/api/samples': {
+          const q = parseSamplesQuery(url.searchParams);
+          if ('error' in q) return send(req, res, 400, { error: q.error });
+          const sensor = sensorParam();
+          if (sensor === false) return;
+          return send(req, res, 200, sensor ? store.samples(sensor.record.id, q.from, q.to, q.limit) : { readings: [], next: null });
         }
         default:
           return send(req, res, 404, { error: 'not found' });

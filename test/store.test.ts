@@ -19,14 +19,16 @@ const row = (i: number, tempC: number, humidity = 50, extra: Partial<MinuteRow> 
 
 describe('Store.readings', () => {
   let store: Store;
+  let S: number;
   beforeEach(() => {
     store = new Store(':memory:');
+    S = store.registerSensor('a4:c1:38:00:00:01').id;
   });
   afterEach(() => store.close());
 
   it('returns rows as-is, oldest first, with inclusive bounds, when within maxPoints', () => {
-    store.upsertMany([row(2, 22), row(0, 20), row(1, 21), row(3, 23)]);
-    expect(store.readings(T0, T0 + 2 * MIN, 10)).toEqual([
+    store.upsertMany(S, [row(2, 22), row(0, 20), row(1, 21), row(3, 23)]);
+    expect(store.readings(S, T0, T0 + 2 * MIN, 10)).toEqual([
       { ts: T0, tempC: 20, humidity: 50, battery: 90, rssi: -60 },
       { ts: T0 + MIN, tempC: 21, humidity: 50, battery: 90, rssi: -60 },
       { ts: T0 + 2 * MIN, tempC: 22, humidity: 50, battery: 90, rssi: -60 },
@@ -34,14 +36,14 @@ describe('Store.readings', () => {
   });
 
   it('returns rows unbucketed when the count equals maxPoints', () => {
-    store.upsertMany([row(0, 20), row(1, 21), row(2, 22)]);
-    expect(store.readings(T0, T0 + 10 * MIN, 3).map((r) => r.ts)).toEqual([T0, T0 + MIN, T0 + 2 * MIN]);
+    store.upsertMany(S, [row(0, 20), row(1, 21), row(2, 22)]);
+    expect(store.readings(S, T0, T0 + 10 * MIN, 3).map((r) => r.ts)).toEqual([T0, T0 + MIN, T0 + 2 * MIN]);
   });
 
   it('averages into equal time buckets keyed by bucket start, omitting empty buckets', () => {
     // Range of 12 minutes [T0, T0 + 12min - 1ms], 4 buckets of 3 minutes each.
     // Bucket 0: minutes 0,1,2; bucket 1: empty (gap); bucket 2: minute 6; bucket 3: minutes 9,11.
-    store.upsertMany([
+    store.upsertMany(S, [
       row(0, 20, 40),
       row(1, 21, 50),
       row(2, 22, 60),
@@ -51,7 +53,7 @@ describe('Store.readings', () => {
     ]);
     const from = T0;
     const to = T0 + 12 * MIN - 1;
-    expect(store.readings(from, to, 4)).toEqual([
+    expect(store.readings(S, from, to, 4)).toEqual([
       { ts: T0, tempC: 21, humidity: 50, battery: 90, rssi: -60 },
       { ts: T0 + 6 * MIN, tempC: 30, humidity: 70, battery: 80, rssi: -70 },
       { ts: T0 + 9 * MIN, tempC: 11, humidity: 32, battery: 90, rssi: -60 },
@@ -59,10 +61,10 @@ describe('Store.readings', () => {
   });
 
   it('never produces more than maxPoints buckets and includes a row at exactly `to`', () => {
-    store.upsertMany(Array.from({ length: 1000 }, (_, i) => row(i, 20 + (i % 7))));
+    store.upsertMany(S, Array.from({ length: 1000 }, (_, i) => row(i, 20 + (i % 7))));
     const from = T0;
     const to = T0 + 999 * MIN;
-    const result = store.readings(from, to, 300);
+    const result = store.readings(S, from, to, 300);
     expect(result.length).toBeLessThanOrEqual(300);
     expect(result.length).toBeGreaterThan(290);
     expect(result[0]!.ts).toBe(from);
@@ -74,9 +76,9 @@ describe('Store.readings', () => {
   });
 
   it('aligns buckets to `from` when it is not a minute boundary', () => {
-    store.upsertMany([row(0, 10), row(1, 20), row(2, 30), row(3, 40)]);
+    store.upsertMany(S, [row(0, 10), row(1, 20), row(2, 30), row(3, 40)]);
     const from = T0 + 30_000;
-    const result = store.readings(from, T0 + 4 * MIN, 2);
+    const result = store.readings(S, from, T0 + 4 * MIN, 2);
     // Rows in range: minutes 1..3 (3 rows > 2). bucketMs = ceil((210000 + 1) / 2) = 105001.
     expect(result).toEqual([
       { ts: from, tempC: 25, humidity: 50, battery: 90, rssi: -60 }, // minutes 1, 2 (offsets 30s, 90s)
@@ -85,23 +87,23 @@ describe('Store.readings', () => {
   });
 
   it('returns an empty list for an empty range', () => {
-    store.upsertMany([row(0, 20)]);
-    expect(store.readings(T0 + MIN, T0 + 100 * MIN, 300)).toEqual([]);
+    store.upsertMany(S, [row(0, 20)]);
+    expect(store.readings(S, T0 + MIN, T0 + 100 * MIN, 300)).toEqual([]);
   });
 
   it('merges a re-written minute as a sample-weighted average', () => {
-    store.upsertMinute(row(0, 20, 40, { samples: 10 }));
-    store.upsertMinute(row(0, 24, 60, { samples: 30, battery: 89 }));
-    expect(store.readings(T0, T0, 10)).toEqual([{ ts: T0, tempC: 23, humidity: 55, battery: 89, rssi: -60 }]);
-    expect(store.stats()).toEqual({ readings: 1, oldest: T0, newest: T0 });
+    store.writeMinute(S, row(0, 20, 40, { samples: 10 }), []);
+    store.writeMinute(S, row(0, 24, 60, { samples: 30, battery: 89 }), []);
+    expect(store.readings(S, T0, T0, 10)).toEqual([{ ts: T0, tempC: 23, humidity: 55, battery: 89, rssi: -60 }]);
+    expect(store.stats()).toEqual({ readings: 1, oldest: T0, newest: T0, samples: 0 });
   });
 
   it('reports newest row and stats', () => {
-    expect(store.newest()).toBeNull();
-    expect(store.stats()).toEqual({ readings: 0, oldest: null, newest: null });
-    store.upsertMany([row(5, 25), row(1, 21)]);
-    expect(store.newest()).toEqual({ ts: T0 + 5 * MIN, tempC: 25, humidity: 50, battery: 90, rssi: -60 });
-    expect(store.stats()).toEqual({ readings: 2, oldest: T0 + MIN, newest: T0 + 5 * MIN });
+    expect(store.newest(S)).toBeNull();
+    expect(store.stats()).toEqual({ readings: 0, oldest: null, newest: null, samples: 0 });
+    store.upsertMany(S, [row(5, 25), row(1, 21)]);
+    expect(store.newest(S)).toEqual({ ts: T0 + 5 * MIN, tempC: 25, humidity: 50, battery: 90, rssi: -60 });
+    expect(store.stats()).toEqual({ readings: 2, oldest: T0 + MIN, newest: T0 + 5 * MIN, samples: 0 });
   });
 });
 

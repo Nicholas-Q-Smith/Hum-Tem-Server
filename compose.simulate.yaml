@@ -1,0 +1,15 @@
+# Run on a Mac (or anywhere) without Bluetooth:
+#   docker compose -f compose.yaml -f compose.simulate.yaml up --build
+# Uses a named volume instead of the host path, and a normal port mapping.
+services:
+  pihumtemp:
+    network_mode: bridge
+    ports:
+      - "8080:8080"
+    environment:
+      SIMULATE: "1"
+    volumes: !override
+      - pihumtemp-sim:/var/lib/pihumtemp
+
+volumes:
+  pihumtemp-sim:

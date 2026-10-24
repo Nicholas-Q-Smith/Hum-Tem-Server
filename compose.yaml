@@ -1,0 +1,32 @@
+# Raspberry Pi deployment:  docker compose up -d --build
+# See README "Running in Docker" for the one-time host setup.
+services:
+  pihumtemp:
+    build: .
+    image: pihumtemp:latest
+    container_name: pihumtemp
+    restart: unless-stopped
+    # Linux Bluetooth sockets only exist in the host network namespace, so BLE
+    # needs host networking. It also means the API is on the host's :8080,
+    # reachable from the LAN and tailscale0 with no port mapping.
+    network_mode: host
+    # Raw HCI sockets (the image gives node cap_net_raw). In Docker's default
+    # set already; listed so it isn't dropped by accident.
+    cap_add:
+      - NET_RAW
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_PATH: /var/lib/pihumtemp/pihumtemp.db
+    volumes:
+      # Persistent database on the host. It survives container rebuilds,
+      # `docker compose down -v`, and deleting this repo checkout.
+      - /var/lib/pihumtemp:/var/lib/pihumtemp
+    init: true
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

@@ -1,4 +1,4 @@
-import type { Sample } from './sensor.js';
+import type { Sample } from './sensors.js';
 
 export const MINUTE_MS = 60_000;
 
@@ -14,6 +14,7 @@ export interface MinuteRow {
 }
 
 interface Accumulator {
+  samples: Sample[];
   tempSum: number;
   humiditySum: number;
   count: number;
@@ -25,12 +26,13 @@ export const minuteStart = (ts: number) => Math.floor(ts / MINUTE_MS) * MINUTE_M
 
 /**
  * Buckets samples by minute and hands each minute to `sink` once it closes:
- * mean temperature/humidity, last battery/RSSI, and the sample count.
+ * mean temperature/humidity, last battery/RSSI, and the sample count, along
+ * with the raw samples so both can be written in one transaction.
  */
 export class MinuteAggregator {
   private readonly buckets = new Map<number, Accumulator>();
 
-  constructor(private readonly sink: (row: MinuteRow) => void) {}
+  constructor(private readonly sink: (row: MinuteRow, samples: Sample[]) => void) {}
 
   add(sample: Sample): void {
     const key = minuteStart(sample.ts);
@@ -38,6 +40,7 @@ export class MinuteAggregator {
     this.flushBefore(key);
     const acc = this.buckets.get(key);
     if (acc) {
+      acc.samples.push(sample);
       acc.tempSum += sample.tempC;
       acc.humiditySum += sample.humidity;
       acc.count += 1;
@@ -45,6 +48,7 @@ export class MinuteAggregator {
       acc.rssi = sample.rssi;
     } else {
       this.buckets.set(key, {
+        samples: [sample],
         tempSum: sample.tempC,
         humiditySum: sample.humidity,
         count: 1,
@@ -76,13 +80,16 @@ export class MinuteAggregator {
   private emit(key: number): void {
     const acc = this.buckets.get(key)!;
     this.buckets.delete(key);
-    this.sink({
-      ts: key,
-      tempC: acc.tempSum / acc.count,
-      humidity: acc.humiditySum / acc.count,
-      battery: acc.battery,
-      rssi: acc.rssi,
-      samples: acc.count,
-    });
+    this.sink(
+      {
+        ts: key,
+        tempC: acc.tempSum / acc.count,
+        humidity: acc.humiditySum / acc.count,
+        battery: acc.battery,
+        rssi: acc.rssi,
+        samples: acc.count,
+      },
+      acc.samples,
+    );
   }
 }

@@ -1,9 +1,13 @@
 # pihumtemp
 
-Records a Govee H5075 thermo-hygrometer over Bluetooth LE on a Raspberry Pi, indefinitely, and serves the data over HTTP for the LocalHumTemp macOS menu bar app.
+Records Govee H5075 thermo-hygrometers (one or several, one per room) over Bluetooth LE on a Raspberry Pi, indefinitely, and serves the data over HTTP for the LocalHumTemp macOS menu bar app.
 
 - Passive BLE scanning with `@abandonware/noble`. The H5075 broadcasts a reading about every 2 s, so no pairing or connection is needed.
-- One SQLite row per minute (mean temperature and humidity, last battery and RSSI, sample count) in `better-sqlite3` (WAL mode). That is about 525k rows a year, which is fine to keep forever.
+- SQLite tables in `better-sqlite3` (WAL mode):
+  - `sensors`: one row per sensor (MAC address, BLE name, room, and running row counts).
+  - `readings`: one row per sensor per minute (mean temperature and humidity, last battery and RSSI, sample count). That's about 525k rows, a few tens of MB, a year. These rows back `/api/readings` and are kept forever.
+  - `samples`: every decoded advertisement with its exact receive time, at the sensor's 0.1 resolution. That's about 15.8M rows, roughly 410 MB, per sensor per year (measured at 26 bytes per sample). Kept forever by default; set `RAW_RETENTION_DAYS` to limit it. Served by `/api/samples`.
+  - A closed minute and its samples are written in a single transaction, one commit per minute instead of one every 2 s, to spare the SD card.
 - HTTP API on `0.0.0.0:8080`, documented in [docs/pi-api.md](docs/pi-api.md).
 
 ## Quick start on a Mac (no sensor)
@@ -14,12 +18,14 @@ npm install
 npm run simulate   # = npm run build && node dist/index.js --simulate
 ```
 
-Simulate mode generates fake H5075 advertisements. On first run it also seeds 30 days of history, with a 3-hour gap two days ago, into `./data/simulate.db`. To change how much history it seeds, set `SIMULATE_BACKFILL_DAYS`; to start over, delete `data/`.
+Simulate mode generates fake H5075 advertisements from three sensors: Living room (the primary), Bedroom and Office, each with its own climate. It also simulates one unconfigured "neighbour" sensor, which shows up under `nearby`. On first run it seeds 30 days of history per sensor into `./data/simulate.db`, each with a 3-hour gap on a different day. To change these, set `SIMULATE_SENSORS` (1–9) and `SIMULATE_BACKFILL_DAYS`; to start over, delete `data/`.
 
 ```sh
 curl localhost:8080/api/health
 curl localhost:8080/api/latest
 curl "localhost:8080/api/readings?from=$(($(date +%s)*1000-86400000))&to=$(($(date +%s)*1000))&maxPoints=300"
+curl localhost:8080/api/sensors
+curl "localhost:8080/api/latest?sensor=a4:c1:38:00:5e:71"     # Bedroom
 ```
 
 (macOS's curl rejects the `:8080/...` shorthand. Use `localhost:8080`.)
@@ -34,7 +40,7 @@ To point the Mac app at it, set its local address to `http://localhost:8080` and
 | `npm start` | run `dist/index.js` (BLE mode) |
 | `npm run simulate` | build and run with fake advertisements |
 | `npm run typecheck` | type-check sources and tests |
-| `npm test` | unit tests (decoder, bucketing query, aggregation, param validation) |
+| `npm test` | unit tests (decoder, bucketing query, raw samples and pruning, aggregation, param validation) |
 
 Flags: `--simulate` (or `SIMULATE=1`) and `--debug`. `--debug` logs every Govee advertisement's raw manufacturer data along with the decoded values, and sets `LOG_LEVEL=debug`.
 
@@ -46,11 +52,21 @@ All settings are environment variables. See [.env.example](.env.example).
 |---|---|---|
 | `PORT` | `8080` | HTTP port (binds `0.0.0.0`) |
 | `DB_PATH` | `/var/lib/pihumtemp/pihumtemp.db` | `./data/simulate.db` in simulate mode |
-| `SENSOR_ADDRESS` | — | MAC of the sensor to record |
-| `SENSOR_NAME` | — | e.g. `GVH5075_3456` |
+| `SENSORS` | — | sensors and rooms, e.g. `A4:C1:38:12:34:56=Living room;A4:C1:38:AB:CD:EF=Bedroom`; first = primary |
+| `SENSOR_ADDRESS` / `SENSOR_NAME` | — | single-sensor shorthand (no room); can't be combined with `SENSORS` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `RAW_RETENTION_DAYS` | `0` | delete raw samples older than N days; `0` keeps them forever |
 
-If neither `SENSOR_ADDRESS` nor `SENSOR_NAME` is set, the first `GVH5075_*` seen is used and its address is logged, so you can pin it.
+### Multiple sensors and rooms
+
+Each H5075 is identified by its MAC address and can be given a room through `SENSORS`. Entries can also be BLE names (`GVH5075_9A2F`) if you don't have the address yet.
+
+- **Primary sensor:** the first entry. `/api/latest`, `/api/readings` and `/api/samples` default to it, so the Mac app keeps working unchanged. Pass `?sensor=<MAC>` to get another sensor's data.
+- **Listing:** `GET /api/sensors` lists every sensor in config order, with its room, latest reading, and row counts, which is enough for a dashboard or layout view. It also lists `nearby` H5075s that are heard but not configured, strongest signal first, to help you find the addresses to add.
+- **Adding a sensor:** add an entry and restart. **Renaming a room:** edit its entry and restart.
+- **Removing a sensor from `SENSORS`:** recording stops, but its history stays queryable, and it is listed with `recording: false`.
+- **No `SENSORS` set:** the sensors already in the database keep being recorded. On an empty database, the first `GVH5075_*` heard is adopted and its address is logged.
+- **Upgrading an older single-sensor database:** its history is attached to the primary sensor the first time it's registered.
 
 ### Layout
 
@@ -60,13 +76,15 @@ src/
   config.ts, logger.ts
   sources/            AdvertisementSource implementations: noble (BLE), simulate
   govee/h5075.ts      manufacturer-data decoder/encoder
-  sensor.ts           picks the configured sensor out of the advertisement stream
+  sensors.ts          sensor config parsing; picks configured sensors out of the advertisement stream
+  recorder.ts         per-sensor state: registration, primary, minute aggregation, latest, stale checks
   aggregator.ts       per-minute aggregation
   store.ts            SQLite schema/migrations, upsert, bucketed range query
   server.ts           HTTP API
+Dockerfile, compose.yaml          container deployment (compose.simulate.yaml for Macs)
 ```
 
-The code leaves room for two later additions. **Multiple sensors:** samples already carry a `sensorId`, and migrations are versioned via `PRAGMA user_version`, so a `sensor` column plus one selector or aggregator per sensor fits in. **On-device history backfill over GATT:** it would be another producer of `MinuteRow`s, and `Store.upsertMinute` already merges duplicate minutes by sample-weighted averaging.
+The code leaves room for later additions. **On-device history backfill over GATT:** it would be another producer of `MinuteRow`s, and `Store.writeMinute` already merges duplicate minutes by sample-weighted averaging and ignores samples it already has.
 
 ## Raspberry Pi setup
 
@@ -125,7 +143,37 @@ Each Govee advertisement is logged like this:
 DEBUG adv a4:c1:38:12:34:56 name=GVH5075_3456 rssi=-71 mfr=88ec00034a8b6400 decoded={"tempC":21.5,"humidity":69.1,"battery":100}
 ```
 
-Compare `decoded` with the sensor's display. The display may round differently by 0.1. If it is set to °F, convert first, because the API is always °C. Then pin the sensor in `/etc/default/pihumtemp` with `SENSOR_ADDRESS=...` and start the service again. A negative-temperature check (e.g. the sensor in a freezer for a few minutes) is worthwhile too.
+Compare `decoded` with the sensor's display. The display may round differently by 0.1. If it is set to °F, convert first, because the API is always °C. Then list your sensors with their rooms in `/etc/default/pihumtemp` (or `.env` for Docker), e.g. `SENSORS=A4:C1:38:12:34:56=Living room`, and start the service again. A negative-temperature check (e.g. the sensor in a freezer for a few minutes) is worthwhile too.
+
+### 2b. Alternative: run in Docker
+
+This replaces step 2: use either `install.sh` (systemd) or Docker, not both. Hostname, Tailscale and backups (steps 1, 4 and 5) work the same way.
+
+```sh
+# One-time host setup
+sudo apt-get install -y bluetooth bluez sqlite3      # host BlueZ owns the adapter; sqlite3 for backups
+curl -fsSL https://get.docker.com | sh               # Docker Engine + compose plugin
+sudo usermod -aG docker $USER && newgrp docker
+sudo install -d -o 1000 -g 1000 -m 0750 /var/lib/pihumtemp   # the container runs as uid 1000 (node)
+
+# Run (and after every git pull)
+cp -n .env.example .env        # optional: set SENSORS (rooms) etc.
+docker compose up -d --build
+docker compose logs -f
+curl http://localhost:8080/api/health
+```
+
+**Persistence:** the database is bind-mounted from the host at `/var/lib/pihumtemp`, the same path the systemd install uses. Rebuilding the image, `docker compose down` (even with `-v`), or deleting the checkout leaves the data alone. SQLite's `-wal`/`-shm` files sit next to the database in the same directory, so the host's `sqlite3 .backup` (step 5, run as root or uid 1000) is safe while the container runs.
+
+If you're switching from the systemd install, run `sudo systemctl disable --now pihumtemp`, then `sudo chown -R 1000:1000 /var/lib/pihumtemp`.
+
+How the container gets at Bluetooth:
+
+- **Host networking:** `network_mode: host` is required because Linux Bluetooth sockets exist only in the host network namespace. As a result, port 8080 is the host's port, reachable over the LAN and `tailscale0` with no port mapping.
+- **Raw sockets without root:** the image gives the node binary `cap_net_raw`, and compose keeps `NET_RAW` in the container. The process runs as the unprivileged `node` user.
+- **Restarts and logs:** `restart: unless-stopped` brings the container back after crashes and reboots. Log size is capped at 3 × 10 MB to spare the SD card.
+
+To try the container on a Mac, where there's no Bluetooth, use `docker compose -f compose.yaml -f compose.simulate.yaml up --build`. That runs simulate mode on `localhost:8080`, with a named volume for the database.
 
 ### BLE without root
 
@@ -165,10 +213,11 @@ This keeps two weeks of daily snapshots. Copy them off the SD card now and then 
 ## Robustness notes
 
 - **Scan recovery:** if the adapter powers off or scanning stops, it is restarted when the adapter comes back.
-- **Watchdog:** if no advertisement from the sensor arrives for 5 minutes, it logs a warning and restarts the scan, repeating every 5 minutes while the sensor stays silent.
+- **Watchdog:** a sensor silent for 5 minutes gets a warning, repeated every 30 minutes. If *no* recorded sensor has been heard for 5 minutes, the scan is restarted, again every 5 minutes while the silence lasts.
 - **Crashes:** systemd restarts the service on failure, with no start-rate limit.
 - **Clock not yet synced:** readings are ignored while the system clock is before 2024. This avoids 1970 timestamps from a Pi without an RTC that booted before NTP sync.
-- **Shutdown:** on SIGTERM the partial minute is flushed. If the same minute is written again after the restart, the two rows are merged by sample-weighted average.
+- **Duplicate events:** noble reports a device again when its scan response arrives, a few ms after the advertisement and with the same data. Identical readings less than 500 ms apart are dropped as echoes, so each broadcast is stored once.
+- **Shutdown:** on SIGTERM the partial minute and its raw samples are flushed. If the same minute is written again after the restart, the two rows are merged by sample-weighted average.
 
 ### Troubleshooting
 

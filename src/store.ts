@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import type { MinuteRow } from './aggregator.js';
+import type { Sample } from './sensors.js';
 
 /** API shape (see docs/pi-api.md). */
 export interface Reading {
@@ -12,13 +13,43 @@ export interface Reading {
   rssi?: number;
 }
 
+/** A row of the `sensors` table. `id` is internal; the API identifies sensors by address. */
+export interface SensorRecord {
+  id: number;
+  /** Canonical MAC address; null only for pre-multi-sensor data not yet claimed by a sensor. */
+  address: string | null;
+  /** BLE local name, e.g. GVH5075_3456. */
+  name: string | null;
+  room: string | null;
+  firstSeen: number | null;
+}
+
 export interface StoreStats {
+  /** Number of stored minute rows. */
   readings: number;
   oldest: number | null;
   newest: number | null;
+  /** Number of stored raw samples. */
+  samples: number;
+}
+
+export interface SamplePage {
+  readings: Reading[];
+  /** Pass as `from` to fetch the next page, or null if this page reached `to`. */
+  next: number | null;
 }
 
 export const MAX_POINTS_LIMIT = 5000;
+export const MAX_SAMPLES_LIMIT = 50_000;
+const PRUNE_BATCH = 10_000;
+
+interface SampleRow {
+  ts: number;
+  temp_x10: number;
+  humidity_x10: number;
+  battery: number | null;
+  rssi: number | null;
+}
 
 interface DbRow {
   ts: number;
@@ -28,16 +59,79 @@ interface DbRow {
   rssi: number | null;
 }
 
+interface SensorDbRow {
+  id: number;
+  address: string | null;
+  name: string | null;
+  room: string | null;
+  first_seen: number | null;
+  reading_count: number;
+  sample_count: number;
+}
+
 /** Schema migrations, applied in order and tracked with PRAGMA user_version. */
 const MIGRATIONS = [
+  // v1: single sensor, one row per minute.
   `CREATE TABLE readings (
-     ts INTEGER PRIMARY KEY,   -- minute start, epoch ms
+     ts INTEGER PRIMARY KEY,
      temp_c REAL NOT NULL,
      humidity REAL NOT NULL,
      battery INTEGER,
      rssi INTEGER,
      samples INTEGER NOT NULL
    )`,
+  // v2: every decoded advertisement.
+  `CREATE TABLE samples (
+     ts INTEGER PRIMARY KEY,
+     temp_x10 INTEGER NOT NULL,
+     humidity_x10 INTEGER NOT NULL,
+     battery INTEGER,
+     rssi INTEGER
+   )`,
+  // v3: multiple sensors. Existing rows move to sensor 1 with a NULL address,
+  // which the primary sensor claims when it is registered.
+  `CREATE TABLE sensors (
+     id INTEGER PRIMARY KEY,
+     address TEXT UNIQUE,      -- canonical MAC, lower-case with colons
+     name TEXT,                -- BLE local name, e.g. GVH5075_3456
+     room TEXT,
+     first_seen INTEGER,       -- epoch ms
+     -- Maintained on every write: COUNT(*) over years of samples takes too long at startup on a Pi.
+     reading_count INTEGER NOT NULL DEFAULT 0,
+     sample_count INTEGER NOT NULL DEFAULT 0
+   );
+   CREATE TABLE readings_v3 (
+     sensor_id INTEGER NOT NULL REFERENCES sensors(id),
+     ts INTEGER NOT NULL,      -- minute start, epoch ms
+     temp_c REAL NOT NULL,
+     humidity REAL NOT NULL,
+     battery INTEGER,
+     rssi INTEGER,
+     samples INTEGER NOT NULL,
+     PRIMARY KEY (sensor_id, ts)
+   ) WITHOUT ROWID;
+   -- Values in tenths (the sensor's resolution), so INTEGER is lossless and compact.
+   CREATE TABLE samples_v3 (
+     sensor_id INTEGER NOT NULL REFERENCES sensors(id),
+     ts INTEGER NOT NULL,      -- receive time, epoch ms
+     temp_x10 INTEGER NOT NULL,
+     humidity_x10 INTEGER NOT NULL,
+     battery INTEGER,
+     rssi INTEGER,
+     PRIMARY KEY (sensor_id, ts)
+   ) WITHOUT ROWID;
+   INSERT INTO sensors (id, address, first_seen)
+     SELECT 1, NULL, MIN(ts) FROM readings HAVING COUNT(*) > 0;
+   INSERT OR IGNORE INTO sensors (id, address) SELECT 1, NULL FROM samples LIMIT 1;
+   INSERT INTO readings_v3 SELECT 1, ts, temp_c, humidity, battery, rssi, samples FROM readings;
+   INSERT INTO samples_v3 SELECT 1, ts, temp_x10, humidity_x10, battery, rssi FROM samples;
+   UPDATE sensors SET
+     reading_count = (SELECT COUNT(*) FROM readings_v3 WHERE sensor_id = sensors.id),
+     sample_count = (SELECT COUNT(*) FROM samples_v3 WHERE sensor_id = sensors.id);
+   DROP TABLE readings;
+   DROP TABLE samples;
+   ALTER TABLE readings_v3 RENAME TO readings;
+   ALTER TABLE samples_v3 RENAME TO samples;`,
 ];
 
 const round = (v: number, digits: number) => {
@@ -52,15 +146,39 @@ function toReading(row: DbRow): Reading {
   return reading;
 }
 
+function sampleToReading(row: SampleRow): Reading {
+  const reading: Reading = { ts: row.ts, tempC: row.temp_x10 / 10, humidity: row.humidity_x10 / 10 };
+  if (row.battery !== null) reading.battery = row.battery;
+  if (row.rssi !== null) reading.rssi = row.rssi;
+  return reading;
+}
+
+function toSensor(row: SensorDbRow): SensorRecord {
+  return { id: row.id, address: row.address, name: row.name, room: row.room, firstSeen: row.first_seen };
+}
+
+const emptyStats = (): StoreStats => ({ readings: 0, oldest: null, newest: null, samples: 0 });
+
+type Range = { sensor: number; from: number; to: number };
+
 export class Store {
   private readonly db: Database.Database;
-  private readonly upsertStmt: Database.Statement;
-  private readonly newestStmt: Database.Statement<[], DbRow>;
-  private readonly countRangeStmt: Database.Statement<{ from: number; to: number }, { n: number }>;
-  private readonly rangeStmt: Database.Statement<{ from: number; to: number }, DbRow>;
-  private readonly bucketStmt: Database.Statement<{ from: number; to: number; bucketMs: number }, DbRow>;
-  private readonly statsStmt: Database.Statement<[], { n: number; oldest: number | null; newest: number | null }>;
-  private cachedStats: StoreStats;
+  private readonly upsertStmt: Database.Statement<Record<string, unknown>, { samples: number }>;
+  private readonly newestStmt: Database.Statement<{ sensor: number }, DbRow>;
+  private readonly countRangeStmt: Database.Statement<Range, { n: number }>;
+  private readonly rangeStmt: Database.Statement<Range, DbRow>;
+  private readonly bucketStmt: Database.Statement<Range & { bucketMs: number }, DbRow>;
+  private readonly insertSampleStmt: Database.Statement;
+  private readonly sampleRangeStmt: Database.Statement<Range & { limit: number }, SampleRow>;
+  private readonly pruneStmt: Database.Statement<{ sensor: number; before: number; batch: number }>;
+  private readonly sensorByAddressStmt: Database.Statement<{ address: string }, SensorDbRow>;
+  private readonly allSensorsStmt: Database.Statement<[], SensorDbRow>;
+  private readonly bumpCountsStmt: Database.Statement<{ sensor: number; readings: number; samples: number }>;
+  /**
+   * Per-sensor counts and bounds. COUNT(*) over millions of rows is slow on a
+   * Pi, so they're computed once at startup and then maintained on each write.
+   */
+  private readonly sensorStatsCache = new Map<number, StoreStats>();
 
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -71,32 +189,52 @@ export class Store {
     this.migrate();
 
     // If a minute is written twice (e.g. a partial minute flushed at shutdown and
-    // the rest after restart), merge it as a sample-weighted average.
+    // the rest after restart), merge it as a sample-weighted average. RETURNING
+    // samples tells the two apart: it equals the new count only on a fresh insert.
     this.upsertStmt = this.db.prepare(`
-      INSERT INTO readings (ts, temp_c, humidity, battery, rssi, samples)
-      VALUES (@ts, @tempC, @humidity, @battery, @rssi, @samples)
-      ON CONFLICT(ts) DO UPDATE SET
+      INSERT INTO readings (sensor_id, ts, temp_c, humidity, battery, rssi, samples)
+      VALUES (@sensor, @ts, @tempC, @humidity, @battery, @rssi, @samples)
+      ON CONFLICT(sensor_id, ts) DO UPDATE SET
         temp_c   = (temp_c * samples + excluded.temp_c * excluded.samples) / (samples + excluded.samples),
         humidity = (humidity * samples + excluded.humidity * excluded.samples) / (samples + excluded.samples),
         battery  = COALESCE(excluded.battery, battery),
         rssi     = COALESCE(excluded.rssi, rssi),
-        samples  = samples + excluded.samples`);
-    this.newestStmt = this.db.prepare('SELECT ts, temp_c, humidity, battery, rssi FROM readings ORDER BY ts DESC LIMIT 1');
-    this.countRangeStmt = this.db.prepare('SELECT COUNT(*) AS n FROM readings WHERE ts BETWEEN @from AND @to');
-    this.rangeStmt = this.db.prepare(
-      'SELECT ts, temp_c, humidity, battery, rssi FROM readings WHERE ts BETWEEN @from AND @to ORDER BY ts',
+        samples  = samples + excluded.samples
+      RETURNING samples`);
+    this.newestStmt = this.db.prepare(
+      'SELECT ts, temp_c, humidity, battery, rssi FROM readings WHERE sensor_id = @sensor ORDER BY ts DESC LIMIT 1',
     );
+    this.countRangeStmt = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM readings WHERE sensor_id = @sensor AND ts BETWEEN @from AND @to',
+    );
+    this.rangeStmt = this.db.prepare(`
+      SELECT ts, temp_c, humidity, battery, rssi FROM readings
+      WHERE sensor_id = @sensor AND ts BETWEEN @from AND @to ORDER BY ts`);
     // CAST guards against the division being done in floating point if a
     // parameter is bound as REAL; bucket indexes are never negative here.
     this.bucketStmt = this.db.prepare(`
       SELECT @from + CAST((ts - @from) / @bucketMs AS INTEGER) * @bucketMs AS ts,
              AVG(temp_c) AS temp_c, AVG(humidity) AS humidity, AVG(battery) AS battery, AVG(rssi) AS rssi
       FROM readings
-      WHERE ts BETWEEN @from AND @to
+      WHERE sensor_id = @sensor AND ts BETWEEN @from AND @to
       GROUP BY CAST((ts - @from) / @bucketMs AS INTEGER)
       ORDER BY ts`);
-    this.statsStmt = this.db.prepare('SELECT COUNT(*) AS n, MIN(ts) AS oldest, MAX(ts) AS newest FROM readings');
-    this.cachedStats = this.computeStats();
+    this.insertSampleStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO samples (sensor_id, ts, temp_x10, humidity_x10, battery, rssi)
+      VALUES (@sensor, @ts, @temp, @humidity, @battery, @rssi)`);
+    this.sampleRangeStmt = this.db.prepare(`
+      SELECT ts, temp_x10, humidity_x10, battery, rssi FROM samples
+      WHERE sensor_id = @sensor AND ts BETWEEN @from AND @to ORDER BY ts LIMIT @limit`);
+    this.pruneStmt = this.db.prepare(`
+      DELETE FROM samples WHERE sensor_id = @sensor AND ts IN
+        (SELECT ts FROM samples WHERE sensor_id = @sensor AND ts < @before ORDER BY ts LIMIT @batch)`);
+    this.sensorByAddressStmt = this.db.prepare('SELECT * FROM sensors WHERE address = @address');
+    this.allSensorsStmt = this.db.prepare('SELECT * FROM sensors ORDER BY id');
+    this.bumpCountsStmt = this.db.prepare(
+      'UPDATE sensors SET reading_count = reading_count + @readings, sample_count = sample_count + @samples WHERE id = @sensor',
+    );
+
+    this.loadStats();
   }
 
   private migrate(): void {
@@ -109,50 +247,188 @@ export class Store {
     }
   }
 
-  upsertMinute(row: MinuteRow): void {
-    this.upsertStmt.run({ battery: null, rssi: null, ...row });
-    this.cachedStats = this.computeStats();
+  /** Counts come from the sensors table; MIN/MAX are cheap primary-key lookups. */
+  private loadStats(): void {
+    const bounds = this.db.prepare(
+      'SELECT (SELECT MIN(ts) FROM readings WHERE sensor_id = @id) AS oldest, (SELECT MAX(ts) FROM readings WHERE sensor_id = @id) AS newest',
+    );
+    for (const s of this.allSensorsStmt.all()) {
+      const { oldest, newest } = bounds.get({ id: s.id }) as { oldest: number | null; newest: number | null };
+      this.sensorStatsCache.set(s.id, { readings: s.reading_count, oldest, newest, samples: s.sample_count });
+    }
   }
 
-  upsertMany(rows: Iterable<MinuteRow>): void {
-    this.db.transaction(() => {
-      for (const row of rows) this.upsertStmt.run({ battery: null, rssi: null, ...row });
+  private statsFor(sensorId: number): StoreStats {
+    let s = this.sensorStatsCache.get(sensorId);
+    if (!s) this.sensorStatsCache.set(sensorId, (s = emptyStats()));
+    return s;
+  }
+
+  // --- sensors ---------------------------------------------------------------
+
+  sensors(): SensorRecord[] {
+    return this.allSensorsStmt.all().map(toSensor);
+  }
+
+  /**
+   * Finds or creates the sensor with this address and updates its name/room
+   * (undefined leaves a field unchanged). With `claimLegacy`, a new address
+   * takes over the pre-multi-sensor data (the NULL-address sensor), if any.
+   */
+  registerSensor(
+    address: string,
+    opts: { name?: string; room?: string; claimLegacy?: boolean; seenAt?: number } = {},
+  ): SensorRecord {
+    return this.db.transaction(() => {
+      const existing = this.sensorByAddressStmt.get({ address });
+      if (existing) {
+        const name = opts.name ?? existing.name;
+        const room = opts.room ?? existing.room;
+        if (name !== existing.name || room !== existing.room) {
+          this.db.prepare('UPDATE sensors SET name = ?, room = ? WHERE id = ?').run(name, room, existing.id);
+        }
+        return toSensor({ ...existing, name, room });
+      }
+      const legacy = opts.claimLegacy
+        ? (this.db.prepare('SELECT * FROM sensors WHERE address IS NULL ORDER BY id LIMIT 1').get() as
+            | SensorDbRow
+            | undefined)
+        : undefined;
+      if (legacy) {
+        this.db
+          .prepare('UPDATE sensors SET address = ?, name = COALESCE(?, name), room = COALESCE(?, room) WHERE id = ?')
+          .run(address, opts.name ?? null, opts.room ?? null, legacy.id);
+        return toSensor(this.sensorByAddressStmt.get({ address })!);
+      }
+      const { lastInsertRowid } = this.db
+        .prepare('INSERT INTO sensors (address, name, room, first_seen) VALUES (?, ?, ?, ?)')
+        .run(address, opts.name ?? null, opts.room ?? null, opts.seenAt ?? null);
+      const id = Number(lastInsertRowid);
+      this.statsFor(id);
+      return { id, address, name: opts.name ?? null, room: opts.room ?? null, firstSeen: opts.seenAt ?? null };
     })();
-    this.cachedStats = this.computeStats();
   }
 
-  /** Cached and refreshed on every write, so /api/health never scans the table. */
+  // --- writes ----------------------------------------------------------------
+
+  /** Writes a closed minute and its raw samples in one transaction (one SD-card commit per minute). */
+  writeMinute(sensorId: number, row: MinuteRow, samples: readonly Sample[]): void {
+    const stats = this.statsFor(sensorId);
+    let inserted = 0;
+    let newRow = false;
+    this.db.transaction(() => {
+      newRow = this.upsertRow(sensorId, row);
+      for (const s of samples) {
+        inserted += this.insertSampleStmt.run({
+          sensor: sensorId,
+          ts: s.ts,
+          temp: Math.round(s.tempC * 10),
+          humidity: Math.round(s.humidity * 10),
+          battery: s.battery,
+          rssi: s.rssi,
+        }).changes;
+      }
+      this.bumpCountsStmt.run({ sensor: sensorId, readings: newRow ? 1 : 0, samples: inserted });
+      this.db.prepare('UPDATE sensors SET first_seen = ? WHERE id = ? AND first_seen IS NULL').run(row.ts, sensorId);
+    })();
+    if (newRow) this.noteRow(stats, row.ts);
+    stats.samples += inserted;
+  }
+
+  /** Bulk-writes minute rows (used to seed simulated history). */
+  upsertMany(sensorId: number, rows: Iterable<MinuteRow>): void {
+    const stats = this.statsFor(sensorId);
+    this.db.transaction(() => {
+      let added = 0;
+      for (const row of rows) {
+        if (this.upsertRow(sensorId, row)) {
+          this.noteRow(stats, row.ts);
+          added++;
+        }
+      }
+      this.bumpCountsStmt.run({ sensor: sensorId, readings: added, samples: 0 });
+    })();
+  }
+
+  private upsertRow(sensorId: number, row: MinuteRow): boolean {
+    const result = this.upsertStmt.get({ battery: null, rssi: null, ...row, sensor: sensorId })!;
+    return result.samples === row.samples;
+  }
+
+  private noteRow(stats: StoreStats, ts: number): void {
+    stats.readings += 1;
+    if (stats.oldest === null || ts < stats.oldest) stats.oldest = ts;
+    if (stats.newest === null || ts > stats.newest) stats.newest = ts;
+  }
+
+  /** Deletes raw samples older than `before`, in small batches so readers aren't blocked. */
+  pruneSamples(before: number): number {
+    let total = 0;
+    for (const [sensor, stats] of this.sensorStatsCache) {
+      for (;;) {
+        const changes = this.db.transaction(() => {
+          const n = this.pruneStmt.run({ sensor, before, batch: PRUNE_BATCH }).changes;
+          this.bumpCountsStmt.run({ sensor, readings: 0, samples: -n });
+          return n;
+        })();
+        total += changes;
+        stats.samples -= changes;
+        if (changes < PRUNE_BATCH) break;
+      }
+    }
+    return total;
+  }
+
+  // --- reads -----------------------------------------------------------------
+
+  /** Totals across all sensors. Served from memory, so /api/health never scans a table. */
   stats(): StoreStats {
-    return this.cachedStats;
+    const total = emptyStats();
+    for (const s of this.sensorStatsCache.values()) {
+      total.readings += s.readings;
+      total.samples += s.samples;
+      if (s.oldest !== null && (total.oldest === null || s.oldest < total.oldest)) total.oldest = s.oldest;
+      if (s.newest !== null && (total.newest === null || s.newest > total.newest)) total.newest = s.newest;
+    }
+    return total;
   }
 
-  newest(): Reading | null {
-    const row = this.newestStmt.get();
+  sensorStats(sensorId: number): StoreStats {
+    return { ...this.statsFor(sensorId) };
+  }
+
+  newest(sensorId: number): Reading | null {
+    const row = this.newestStmt.get({ sensor: sensorId });
     return row ? toReading(row) : null;
   }
 
   /**
-   * Rows with from <= ts <= to, oldest first. If there are more than
+   * Minute rows with from <= ts <= to, oldest first. If there are more than
    * `maxPoints`, the range is split into `maxPoints` equal buckets and one
    * averaged reading is returned per non-empty bucket (ts = bucket start).
    */
-  readings(from: number, to: number, maxPoints: number): Reading[] {
+  readings(sensorId: number, from: number, to: number, maxPoints: number): Reading[] {
     const points = Math.min(MAX_POINTS_LIMIT, Math.max(1, Math.floor(maxPoints)));
-    const { n } = this.countRangeStmt.get({ from, to })!;
+    const range = { sensor: sensorId, from, to };
+    const { n } = this.countRangeStmt.get(range)!;
     if (n === 0) return [];
-    if (n <= points) return this.rangeStmt.all({ from, to }).map(toReading);
+    if (n <= points) return this.rangeStmt.all(range).map(toReading);
     // The range is inclusive, so it spans to - from + 1 ms; rounding up keeps
     // the bucket index of `to` at most points - 1.
     const bucketMs = Math.max(1, Math.ceil((to - from + 1) / points));
-    return this.bucketStmt.all({ from, to, bucketMs }).map(toReading);
+    return this.bucketStmt.all({ ...range, bucketMs }).map(toReading);
+  }
+
+  /** Raw samples with from <= ts <= to, oldest first, at most `limit` per page. */
+  samples(sensorId: number, from: number, to: number, limit: number): SamplePage {
+    const max = Math.min(MAX_SAMPLES_LIMIT, Math.max(1, Math.floor(limit)));
+    const rows = this.sampleRangeStmt.all({ sensor: sensorId, from, to, limit: max + 1 });
+    const more = rows.length > max;
+    const page = rows.slice(0, max).map(sampleToReading);
+    return { readings: page, next: more ? page.at(-1)!.ts + 1 : null };
   }
 
   close(): void {
     this.db.close();
-  }
-
-  private computeStats(): StoreStats {
-    const { n, oldest, newest } = this.statsStmt.get()!;
-    return { readings: n, oldest, newest };
   }
 }
