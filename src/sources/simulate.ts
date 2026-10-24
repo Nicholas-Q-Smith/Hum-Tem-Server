@@ -95,6 +95,10 @@ export class SimulatedSource implements AdvertisementSource {
     this.emit();
   }
 
+  status() {
+    return { state: 'simulated', scanning: this.timer !== undefined, error: null };
+  }
+
   async restart(): Promise<void> {
     clearInterval(this.timer);
     this.schedule();

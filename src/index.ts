@@ -117,7 +117,15 @@ if (config.rawRetentionDays > 0) {
   log.info('Keeping raw samples forever (RAW_RETENTION_DAYS=0)');
 }
 
-const server = createApiServer({ store, recorder, nearby: () => selector.nearby(), uptime, version, log });
+const server = createApiServer({
+  store,
+  recorder,
+  nearby: () => selector.nearby(),
+  uptime,
+  bluetooth: () => source.status(),
+  version,
+  log,
+});
 server.on('error', (err) => {
   log.error('HTTP server error:', err);
   process.exit(1);
@@ -125,23 +133,32 @@ server.on('error', (err) => {
 server.listen(config.port, config.host, () => log.info(`HTTP API listening on http://${config.host}:${config.port}`));
 
 scheduleMinuteFlush();
-source
-  .start((adv) => {
-    const match = selector.handle(adv);
-    if (match) recorder.handle(match);
-  })
-  .catch((err) => {
-    log.error('Failed to start advertisement source:', err);
-    process.exit(1);
-  });
 
+// If Bluetooth can't be opened, keep serving the API (history, uptime, and the
+// error in /api/health) and keep trying, rather than exiting.
 let shuttingDown = false;
+const SOURCE_RETRY_MS = 30_000;
+let sourceRetry: NodeJS.Timeout | undefined;
+function startSource(): void {
+  source
+    .start((adv) => {
+      const match = selector.handle(adv);
+      if (match) recorder.handle(match);
+    })
+    .catch((err) => {
+      log.error(`Failed to start Bluetooth (retrying in ${SOURCE_RETRY_MS / 1000}s):`, err instanceof Error ? err.message : err);
+      if (!shuttingDown) sourceRetry = setTimeout(startSource, SOURCE_RETRY_MS);
+    });
+}
+startSource();
+
 async function shutdown(signal: string, code = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   log.info(`${signal} received, shutting down`);
   clearInterval(watchdog);
   clearInterval(heartbeat);
+  clearTimeout(sourceRetry);
   clearInterval(pruneTimer);
   clearTimeout(minuteTimer);
   await source.stop().catch(() => {});

@@ -27,8 +27,15 @@ used (`managedBy: "config"`), in which case the write endpoints below answer `40
 Fast; the client calls it with a 1.5 s timeout to choose between LAN and tailnet.
 
 ```json
-{ "ok": true, "version": "1.0.0", "readings": 129060, "oldest": 1790238960000, "newest": 1792830960000, "samples": 5400, "sensors": 3, "lastAdvertisement": 1792830985107 }
+{ "ok": true, "version": "1.0.0", "readings": 129060, "oldest": 1790238960000, "newest": 1792830960000, "samples": 5400, "sensors": 3, "lastAdvertisement": 1792830985107,
+  "bluetooth": { "state": "poweredOn", "scanning": true, "error": null } }
 ```
+
+`bluetooth` is the scanner's state, so a client can tell "server up, Bluetooth broken" from "sensor out of range":
+`{ "state": "poweredOn", "scanning": true, "error": null }`. `state` is the adapter state (`poweredOn`,
+`poweredOff`, `unauthorized`, ...), `"unavailable"` if Bluetooth couldn't be opened at all, or `"simulated"`;
+`error` is the last problem, cleared once scanning works. The server keeps serving and retries Bluetooth
+every 30 s.
 
 Only `ok` is required by the client. Totals across all sensors: `readings` is the number of stored minute rows,
 `samples` the number of raw samples, `sensors` the number of known sensors, and `lastAdvertisement` the time of

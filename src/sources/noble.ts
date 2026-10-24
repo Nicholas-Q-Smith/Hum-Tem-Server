@@ -1,7 +1,11 @@
+import { createRequire } from 'node:module';
 import type { Logger } from '../logger.js';
-import type { Advertisement, AdvertisementSource } from './types.js';
+import type { Advertisement, AdvertisementSource, SourceStatus } from './types.js';
 
 type Noble = typeof import('@abandonware/noble');
+// require() rather than import(): a failed CommonJS load (e.g. no Bluetooth socket
+// support) isn't cached, so a later start() can try again.
+const require = createRequire(import.meta.url);
 
 const RETRY_MS = 5_000;
 
@@ -10,13 +14,26 @@ export class NobleSource implements AdvertisementSource {
   private noble?: Noble;
   private stopping = false;
   private retryTimer?: NodeJS.Timeout;
+  private scanning = false;
+  private error: string | null = null;
 
   constructor(private readonly log: Logger) {}
 
+  status(): SourceStatus {
+    return { state: this.noble ? this.noble._state : 'unavailable', scanning: this.scanning, error: this.error };
+  }
+
   async start(onAdvertisement: (adv: Advertisement) => void): Promise<void> {
-    // Imported lazily so --simulate never touches Bluetooth.
-    const noble = ((await import('@abandonware/noble')) as { default: Noble }).default;
+    // Loaded lazily so --simulate never touches Bluetooth.
+    let noble: Noble;
+    try {
+      noble = require('@abandonware/noble') as Noble;
+    } catch (err) {
+      this.error = `Bluetooth unavailable: ${err instanceof Error ? err.message : String(err)}`;
+      throw err;
+    }
     this.noble = noble;
+    this.error = null;
 
     noble.on('stateChange', (state) => {
       if (state === 'poweredOn') {
@@ -26,13 +43,21 @@ export class NobleSource implements AdvertisementSource {
         this.log.warn(`Bluetooth adapter state: ${state}; waiting for it to power on`);
       }
     });
-    noble.on('scanStart', () => this.log.info('BLE scan started'));
+    noble.on('scanStart', () => {
+      this.scanning = true;
+      this.error = null;
+      this.log.info('BLE scan started');
+    });
     noble.on('scanStop', () => {
+      this.scanning = false;
       if (this.stopping) return;
       this.log.warn('BLE scan stopped unexpectedly; restarting');
       this.scheduleRetry();
     });
-    noble.on('warning', (msg: string) => this.log.warn(`noble: ${msg}`));
+    noble.on('warning', (msg: string) => {
+      this.error = msg;
+      this.log.warn(`noble: ${msg}`);
+    });
     noble.on('discover', (p) => {
       onAdvertisement({
         id: p.id,
@@ -86,7 +111,8 @@ export class NobleSource implements AdvertisementSource {
       // allowDuplicates: every advertisement carries a fresh reading.
       await noble.startScanningAsync([], true);
     } catch (err) {
-      this.log.error(`Failed to start BLE scan: ${String(err)}`);
+      this.error = `Failed to start BLE scan: ${String(err)}`;
+      this.log.error(this.error);
       this.scheduleRetry();
     }
   }

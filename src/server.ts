@@ -3,6 +3,7 @@ import type { Logger } from './logger.js';
 import { type Recorder, SensorAdminError, type TrackedSensor } from './recorder.js';
 import type { NearbyDevice, Sample } from './sensors.js';
 import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type SamplePage, type Store } from './store.js';
+import type { SourceStatus } from './sources/types.js';
 import type { Uptime } from './uptime.js';
 
 export interface ApiDeps {
@@ -11,6 +12,8 @@ export interface ApiDeps {
   /** H5075s heard but not recorded. */
   nearby: () => NearbyDevice[];
   uptime: Uptime;
+  /** Bluetooth/source state for /api/health. */
+  bluetooth?: () => SourceStatus;
   version: string;
   log: Logger;
 }
@@ -117,7 +120,7 @@ function send(req: IncomingMessage, res: ServerResponse, status: number, body: u
   res.end(req.method === 'HEAD' ? undefined : json);
 }
 
-export function createApiServer({ store, recorder, nearby, uptime, version, log }: ApiDeps): Server {
+export function createApiServer({ store, recorder, nearby, uptime, bluetooth, version, log }: ApiDeps): Server {
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     /**
@@ -181,6 +184,7 @@ export function createApiServer({ store, recorder, nearby, uptime, version, log 
             samples: stats.samples,
             sensors: recorder.list().length,
             lastAdvertisement: recorder.lastAdvertisement(),
+            bluetooth: bluetooth?.() ?? null,
           });
         }
         case '/api/sensors':
