@@ -16,6 +16,7 @@ import {
 } from './sources/simulate.js';
 import type { AdvertisementSource } from './sources/types.js';
 import { Store } from './store.js';
+import { HEARTBEAT_MS, Uptime } from './uptime.js';
 
 const WATCHDOG_INTERVAL_MS = 30_000;
 
@@ -52,6 +53,11 @@ const stats = store.stats();
 log.info(`Database has ${stats.readings} minute rows and ${stats.samples} raw samples`);
 
 const recorder = new Recorder(store, config.sensors, log);
+
+// Record when the server is up, so clients can tell "server down" from "sensor not heard".
+const uptime = new Uptime(store, log);
+uptime.beat();
+const heartbeat = setInterval(() => uptime.beat(), HEARTBEAT_MS);
 
 // Simulate mode: on a fresh database, register the fake sensors with their rooms
 // the same way the app would, so they stay editable from the app.
@@ -111,7 +117,7 @@ if (config.rawRetentionDays > 0) {
   log.info('Keeping raw samples forever (RAW_RETENTION_DAYS=0)');
 }
 
-const server = createApiServer({ store, recorder, nearby: () => selector.nearby(), version, log });
+const server = createApiServer({ store, recorder, nearby: () => selector.nearby(), uptime, version, log });
 server.on('error', (err) => {
   log.error('HTTP server error:', err);
   process.exit(1);
@@ -135,11 +141,13 @@ async function shutdown(signal: string, code = 0): Promise<void> {
   shuttingDown = true;
   log.info(`${signal} received, shutting down`);
   clearInterval(watchdog);
+  clearInterval(heartbeat);
   clearInterval(pruneTimer);
   clearTimeout(minuteTimer);
   await source.stop().catch(() => {});
   // The open minute is partial; the upsert merges it with the rest after restart.
   recorder.flushAll();
+  uptime.beat();
   server.close();
   server.closeAllConnections();
   store.close();

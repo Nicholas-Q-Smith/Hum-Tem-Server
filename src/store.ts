@@ -150,7 +150,18 @@ const MIGRATIONS = [
   `ALTER TABLE sensors ADD COLUMN recording INTEGER NOT NULL DEFAULT 1;
    ALTER TABLE sensors ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
    UPDATE sensors SET position = id;`,
+  // v5: when the server itself was running, so clients can tell "server down" from "sensor not heard".
+  `CREATE TABLE runs (
+     started INTEGER PRIMARY KEY,   -- epoch ms
+     last_seen INTEGER NOT NULL     -- epoch ms, updated by a heartbeat
+   )`,
 ];
+
+/** One period the server was running. */
+export interface Run {
+  started: number;
+  lastSeen: number;
+}
 
 const round = (v: number, digits: number) => {
   const f = 10 ** digits;
@@ -476,6 +487,26 @@ export class Store {
     const more = rows.length > max;
     const page = rows.slice(0, max).map(sampleToReading);
     return { readings: page, next: more ? page.at(-1)!.ts + 1 : null };
+  }
+
+  startRun(started: number): void {
+    this.db.prepare('INSERT OR REPLACE INTO runs (started, last_seen) VALUES (?, ?)').run(started, started);
+  }
+
+  heartbeat(started: number, now: number): void {
+    this.db.prepare('UPDATE runs SET last_seen = ? WHERE started = ?').run(now, started);
+  }
+
+  /** Runs overlapping [from, to], oldest first. */
+  runs(from: number, to: number): Run[] {
+    return this.db
+      .prepare<[number, number], Run>('SELECT started, last_seen AS lastSeen FROM runs WHERE last_seen >= ? AND started <= ? ORDER BY started')
+      .all(from, to);
+  }
+
+  /** Start of the earliest recorded run: uptime is unknown before this. */
+  firstRun(): number | null {
+    return (this.db.prepare('SELECT MIN(started) AS t FROM runs').get() as { t: number | null }).t;
   }
 
   close(): void {

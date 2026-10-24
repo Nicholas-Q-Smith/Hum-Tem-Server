@@ -3,12 +3,14 @@ import type { Logger } from './logger.js';
 import { type Recorder, SensorAdminError, type TrackedSensor } from './recorder.js';
 import type { NearbyDevice, Sample } from './sensors.js';
 import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type SamplePage, type Store } from './store.js';
+import type { Uptime } from './uptime.js';
 
 export interface ApiDeps {
   store: Store;
   recorder: Recorder;
   /** H5075s heard but not recorded. */
   nearby: () => NearbyDevice[];
+  uptime: Uptime;
   version: string;
   log: Logger;
 }
@@ -39,6 +41,17 @@ export function parseReadingsQuery(params: URLSearchParams): ReadingsQuery | { e
   if (from === undefined || to === undefined) return { error: 'from and to are required (epoch ms)' };
   if (from > to) return { error: 'from must be <= to' };
   return { from, to, maxPoints: Math.min(MAX_POINTS_LIMIT, Math.max(1, maxPoints ?? DEFAULT_MAX_POINTS)) };
+}
+
+/** Validates /api/uptime params; returns an error message for a 400. */
+export function parseRangeQuery(params: URLSearchParams): { from: number; to: number } | { error: string } {
+  const from = parseInteger(params, 'from');
+  if (from instanceof Error) return { error: from.message };
+  const to = parseInteger(params, 'to');
+  if (to instanceof Error) return { error: to.message };
+  if (from === undefined || to === undefined) return { error: 'from and to are required (epoch ms)' };
+  if (from > to) return { error: 'from must be <= to' };
+  return { from, to };
 }
 
 /** Validates /api/samples params; returns an error message for a 400. */
@@ -104,7 +117,7 @@ function send(req: IncomingMessage, res: ServerResponse, status: number, body: u
   res.end(req.method === 'HEAD' ? undefined : json);
 }
 
-export function createApiServer({ store, recorder, nearby, version, log }: ApiDeps): Server {
+export function createApiServer({ store, recorder, nearby, uptime, version, log }: ApiDeps): Server {
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     /**
@@ -185,6 +198,11 @@ export function createApiServer({ store, recorder, nearby, version, log }: ApiDe
           return send(req, res, 200, {
             readings: sensor ? store.readings(sensor.record.id, q.from, q.to, q.maxPoints) : [],
           });
+        }
+        case '/api/uptime': {
+          const q = parseRangeQuery(url.searchParams);
+          if ('error' in q) return send(req, res, 400, { error: q.error });
+          return send(req, res, 200, uptime.query(q.from, q.to));
         }
         case '/api/samples': {
           const q = parseSamplesQuery(url.searchParams);

@@ -109,6 +109,23 @@ The most recent raw sample (updated every ~2 s). After a restart, before the fir
 - If the range holds ≤ `maxPoints` rows, they are returned as-is (one per minute).
 - Otherwise `[from, to]` is split into `maxPoints` equal buckets of `ceil((to - from + 1) / maxPoints)` ms. One averaged reading is returned per **non-empty** bucket with `ts` = bucket start (`from + i * bucketMs`). Empty buckets are left out, so the client can draw gaps where data is missing.
 
+## `GET /api/uptime?from=<ms>&to=<ms>`
+
+When the server itself was running, so a client can tell **server down** (no runs) from **sensor not heard**
+(a run, but no readings) when it finds a gap in the data.
+
+```json
+{ "heartbeatMs": 60000, "since": 1792800000000, "runs": [ { "start": 1792800000000, "end": 1792830000000 }, { "start": 1792833600000, "end": 1792840000000 } ] }
+```
+
+- `runs` overlap `[from, to]`, oldest first. Time between two runs is downtime.
+- Each run's `end` is its last heartbeat, written every `heartbeatMs`, so downtime is accurate to about a minute.
+  The current run's `end` is the time of the request.
+- `since` is the start of the first recorded run. Before it, uptime is unknown (the database predates uptime
+  tracking); `null` if nothing has been recorded yet.
+- A run is split if the clock jumps (e.g. a Pi without a real-time clock correcting its time after boot), and
+  nothing is recorded while the clock is unset (before 2024).
+
 ## `GET /api/samples?from=<ms>&to=<ms>&limit=<n>[&sensor=<MAC>]`
 
 Raw samples: every decoded advertisement (about one every 2 s), with its exact receive time.

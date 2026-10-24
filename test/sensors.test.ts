@@ -12,6 +12,7 @@ import { canonicalAddress, parseSensorsSpec, SensorSelector, type SensorSpec } f
 import { createApiServer } from '../src/server.js';
 import type { Advertisement } from '../src/sources/types.js';
 import { Store } from '../src/store.js';
+import { Uptime } from '../src/uptime.js';
 
 const log = createLogger('error');
 const T0 = Date.UTC(2026, 0, 1, 12);
@@ -57,7 +58,7 @@ async function setup(specs: SensorSpec[], dbPath = ':memory:') {
   const store = new Store(dbPath);
   const recorder = new Recorder(store, specs, log);
   const selector = new SensorSelector(recorder.matcher, log);
-  const server: Server = createApiServer({ store, recorder, nearby: () => selector.nearby(T0), version: 't', log });
+  const server: Server = createApiServer({ store, recorder, nearby: () => selector.nearby(T0), uptime: new Uptime(store, log), version: 't', log });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const feed = (a: Advertisement) => {
