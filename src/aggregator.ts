@@ -77,6 +77,14 @@ export class MinuteAggregator {
     return keys.length;
   }
 
+  /** Drops everything not flushed yet; returns how many samples were dropped. */
+  discard(): number {
+    let n = 0;
+    for (const acc of this.buckets.values()) n += acc.count;
+    this.buckets.clear();
+    return n;
+  }
+
   /** Samples of minutes not flushed yet (normally just the current one), oldest first. */
   pending(): Sample[] {
     return [...this.buckets.keys()].sort((a, b) => a - b).flatMap((key) => this.buckets.get(key)!.samples);

@@ -493,6 +493,14 @@ export class Store {
     this.db.prepare('INSERT OR REPLACE INTO runs (started, last_seen) VALUES (?, ?)').run(started, started);
   }
 
+  /** Re-anchors a run after the wall clock was stepped (its start was recorded on the old clock). */
+  moveRun(oldStarted: number, started: number, lastSeen: number): void {
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM runs WHERE started = ?').run(oldStarted);
+      this.db.prepare('INSERT OR REPLACE INTO runs (started, last_seen) VALUES (?, ?)').run(started, lastSeen);
+    })();
+  }
+
   heartbeat(started: number, now: number): void {
     this.db.prepare('UPDATE runs SET last_seen = ? WHERE started = ?').run(now, started);
   }

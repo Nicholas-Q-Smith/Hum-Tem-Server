@@ -1,4 +1,5 @@
 import { MINUTE_MS, MinuteAggregator } from './aggregator.js';
+import { ClockWatch, monotonicNow } from './clock.js';
 import { H5075_NAME_PREFIX } from './govee/h5075.js';
 import type { Logger } from './logger.js';
 import { canonicalAddress, type Decision, type Match, type SensorSpec } from './sensors.js';
@@ -67,15 +68,20 @@ export class SensorAdminError extends Error {
  */
 export class Recorder {
   readonly managedBy: ManagedBy;
+  private readonly monoNow: () => number;
   private readonly byId = new Map<string, TrackedSensor>();
   private readonly startedAt = Date.now();
   private clockWarned = false;
+  private readonly clock: ClockWatch;
 
   constructor(
     private readonly store: Store,
     private readonly specs: readonly SensorSpec[],
     private readonly log: Logger,
+    monoNow: () => number = monotonicNow,
   ) {
+    this.monoNow = monoNow;
+    this.clock = new ClockWatch(Date.now(), monoNow());
     this.managedBy = specs.length ? 'config' : 'api';
     // Every sensor with history is queryable, recorded or not.
     for (const record of store.sensors()) if (record.address) this.track(record);
@@ -112,6 +118,20 @@ export class Recorder {
       return;
     }
     this.clockWarned = false;
+
+    // Readings buffered before a clock step carry timestamps from the wrong clock
+    // (e.g. fake-hwclock's stale boot time before NTP syncs); don't store them.
+    const step = this.clock.check(sample.ts, this.monoNow());
+    if (step !== 0) {
+      let dropped = 0;
+      for (const s of this.byId.values()) {
+        dropped += s.aggregator.discard();
+        if (s.latest && s.latest.ts > sample.ts) s.latest = null;
+      }
+      this.log.warn(
+        `Clock stepped by ${Math.round(step / 1000)}s; discarded ${dropped} unsaved reading(s) taken on the old clock`,
+      );
+    }
 
     let sensor = this.byId.get(sample.sensorId);
     if (!sensor) {

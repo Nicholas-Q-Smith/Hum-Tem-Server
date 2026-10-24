@@ -11,51 +11,89 @@ const log = createLogger('error');
 const T0 = Date.UTC(2026, 0, 1);
 const MIN = 60_000;
 
-function fresh() {
-  const store = new Store(':memory:');
-  return { store, uptime: new Uptime(store, log) };
+/**
+ * An Uptime whose monotonic clock is under test control. `beat(wall)` assumes the
+ * clocks advance together (mono = wall - T0); pass `mono` to simulate a clock step.
+ */
+function tracker(store = new Store(':memory:'), startWall = T0) {
+  const uptime = new Uptime(store, log, startWall - T0);
+  return { store, uptime, beat: (wall: number, mono = wall - T0) => uptime.beat(wall, mono) };
 }
 
 describe('Uptime', () => {
   it('extends one run with each heartbeat', () => {
-    const { store, uptime } = fresh();
-    uptime.beat(T0);
-    uptime.beat(T0 + HEARTBEAT_MS);
-    uptime.beat(T0 + 2 * HEARTBEAT_MS);
+    const { store, beat } = tracker();
+    beat(T0);
+    beat(T0 + HEARTBEAT_MS);
+    beat(T0 + 2 * HEARTBEAT_MS);
     expect(store.runs(0, Infinity)).toEqual([{ started: T0, lastSeen: T0 + 2 * HEARTBEAT_MS }]);
   });
 
   it('starts a new run after a restart, leaving the downtime between them', () => {
     const store = new Store(':memory:');
-    new Uptime(store, log).beat(T0);
-    new Uptime(store, log).beat(T0 + 30 * MIN); // restarted half an hour later
+    tracker(store).beat(T0);
+    tracker(store, T0 + 30 * MIN).beat(T0 + 30 * MIN); // restarted half an hour later
     expect(store.runs(0, Infinity)).toEqual([
       { started: T0, lastSeen: T0 },
       { started: T0 + 30 * MIN, lastSeen: T0 + 30 * MIN },
     ]);
   });
 
-  it('splits the run when the clock jumps or the process stalls', () => {
-    const { store, uptime } = fresh();
-    uptime.beat(T0);
-    uptime.beat(T0 + HEARTBEAT_MS);
-    uptime.beat(T0 + 2 * 3_600_000); // e.g. NTP corrected a stale boot clock
-    uptime.beat(T0 - 5 * MIN); // clock went backwards
-    expect(store.runs(-Infinity, Infinity).map((r) => r.started)).toEqual([T0 - 5 * MIN, T0, T0 + 2 * 3_600_000]);
+  it('re-anchors the run when the clock is stepped, so a stale boot clock leaves no stray run', () => {
+    // Previous run until T0; the Pi reboots and fake-hwclock restores T0 + 5s,
+    // although it is really T0 + 2h. NTP fixes the clock 20s after start.
+    const store = new Store(':memory:');
+    tracker(store).beat(T0);
+    const stale = T0 + 5_000;
+    const real = T0 + 2 * 3_600_000;
+    const uptime = new Uptime(store, log, 0);
+    uptime.beat(stale, 0); // startup, stale clock
+    uptime.beat(real + 60_000, 60_000); // first heartbeat after NTP
+    uptime.beat(real + 120_000, 120_000);
+    expect(store.runs(-Infinity, Infinity)).toEqual([
+      { started: T0, lastSeen: T0 },
+      { started: real, lastSeen: real + 120_000 }, // up since the real boot time; the 2 h outage remains
+    ]);
   });
 
-  it('records nothing while the clock is unset', () => {
-    const { store, uptime } = fresh();
-    uptime.beat(Date.UTC(1970, 0, 2));
+  it('catches small steps too (a short outage is not hidden)', () => {
+    const store = new Store(':memory:');
+    tracker(store).beat(T0);
+    const uptime = new Uptime(store, log, 0);
+    uptime.beat(T0 + 1_000, 0); // stale: looks like we came straight back
+    uptime.beat(T0 + 150_000 + 60_000, 60_000); // really back after 2.5 min
+    expect(store.runs(-Infinity, Infinity).map((r) => r.started)).toEqual([T0, T0 + 150_000]);
+  });
+
+  it('a backwards step is corrected the same way', () => {
+    const { store, beat } = tracker();
+    beat(T0);
+    beat(T0 - 10 * MIN + HEARTBEAT_MS, HEARTBEAT_MS); // clock set back 10 min
+    expect(store.runs(-Infinity, Infinity)).toEqual([{ started: T0 - 10 * MIN, lastSeen: T0 - 10 * MIN + HEARTBEAT_MS }]);
+  });
+
+  it('splits the run when the process stalls', () => {
+    const { store, beat } = tracker();
+    beat(T0);
+    beat(T0 + HEARTBEAT_MS);
+    beat(T0 + 30 * MIN); // both clocks moved 29 min: frozen, not a clock step
+    expect(store.runs(-Infinity, Infinity).map((r) => r.started)).toEqual([T0, T0 + 30 * MIN]);
+  });
+
+  it('records nothing while the clock is unset, then dates the run from process start', () => {
+    const { store, uptime } = tracker(new Store(':memory:'), T0);
+    uptime.beat(Date.UTC(1970, 0, 2), 0);
     expect(store.runs(-Infinity, Infinity)).toEqual([]);
     expect(uptime.query(0, Infinity).since).toBeNull();
+    uptime.beat(T0 + 90_000, 90_000); // clock set 90 s after start
+    expect(store.runs(-Infinity, Infinity)).toEqual([{ started: T0, lastSeen: T0 + 90_000 }]);
   });
 
   it('reports the current run as lasting until now, and earlier runs as recorded', () => {
     const store = new Store(':memory:');
-    new Uptime(store, log).beat(T0);
-    const uptime = new Uptime(store, log);
-    uptime.beat(T0 + 10 * MIN);
+    tracker(store).beat(T0);
+    const { uptime, beat } = tracker(store, T0 + 10 * MIN);
+    beat(T0 + 10 * MIN);
     expect(uptime.query(T0 - MIN, T0 + 20 * MIN, T0 + 12 * MIN)).toEqual({
       heartbeatMs: HEARTBEAT_MS,
       since: T0,
@@ -68,9 +106,9 @@ describe('Uptime', () => {
 
   it('only returns runs overlapping the range', () => {
     const store = new Store(':memory:');
-    new Uptime(store, log).beat(T0);
-    new Uptime(store, log).beat(T0 + 60 * MIN);
-    const uptime = new Uptime(store, log);
+    tracker(store).beat(T0);
+    tracker(store, T0 + 60 * MIN).beat(T0 + 60 * MIN);
+    const { uptime } = tracker(store);
     expect(uptime.query(T0 + 30 * MIN, T0 + 40 * MIN, T0 + 90 * MIN).runs).toEqual([]);
     expect(uptime.query(T0 + 30 * MIN, T0 + 70 * MIN, T0 + 90 * MIN).runs).toEqual([{ start: T0 + 60 * MIN, end: T0 + 60 * MIN }]);
   });
