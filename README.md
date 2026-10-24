@@ -104,12 +104,16 @@ sudo systemctl restart avahi-daemon
 
 ### 2. Install pihumtemp
 
-Copy this repo to the Pi (e.g. `git clone` or `rsync -a --exclude node_modules ./ pi@pihumtemp.local:pihumtemp/`), then:
+Clone the repo on the Pi, then run the installer:
 
 ```sh
-cd pihumtemp
+sudo apt-get install -y git
+git clone https://github.com/Nicholas-Q-Smith/Hum-Tem-Server.git ~/pihumtemp
+cd ~/pihumtemp
 sudo ./install.sh
 ```
+
+To update later: `cd ~/pihumtemp && git pull && sudo ./install.sh`.
 
 `install.sh` is safe to re-run; run it again after pulling changes. It does the following:
 
@@ -155,6 +159,10 @@ sudo apt-get install -y bluetooth bluez sqlite3      # host BlueZ owns the adapt
 curl -fsSL https://get.docker.com | sh               # Docker Engine + compose plugin
 sudo usermod -aG docker $USER && newgrp docker
 sudo install -d -o 1000 -g 1000 -m 0750 /var/lib/pihumtemp   # the container runs as uid 1000 (node)
+
+# Get the code
+git clone https://github.com/Nicholas-Q-Smith/Hum-Tem-Server.git ~/pihumtemp
+cd ~/pihumtemp
 
 # Run (and after every git pull)
 cp -n .env.example .env        # optional: set SENSORS (rooms) etc.
