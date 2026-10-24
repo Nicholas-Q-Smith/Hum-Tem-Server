@@ -152,7 +152,7 @@ describe('SensorSelector echo suppression', () => {
   });
 
   it('drops the scan-response echo but keeps the next real advertisement', () => {
-    const sel = new SensorSelector([], [], log);
+    const sel = new SensorSelector(() => ({ record: true }), log);
     expect(sel.handle(adv(T0, 21))).not.toBeNull();
     expect(sel.handle(adv(T0 + 5, 21, -62))).toBeNull(); // echo
     expect(sel.handle(adv(T0 + 2_000, 21))).not.toBeNull(); // same value, next broadcast

@@ -51,13 +51,15 @@ try {
 const stats = store.stats();
 log.info(`Database has ${stats.readings} minute rows and ${stats.samples} raw samples`);
 
-// In simulate mode, unless SENSORS is set, record the fake devices under their rooms.
-const simDevices = config.simulate ? simulatedDevices(config.simulateSensors) : [];
-const specs =
-  config.sensors.length || !config.simulate ? config.sensors : simDevices.map((d) => ({ address: d.address, room: d.room }));
+const recorder = new Recorder(store, config.sensors, log);
 
-const recorder = new Recorder(store, specs, log);
-const selector = new SensorSelector(specs, recorder.knownIds(), log, config.debug);
+// Simulate mode: on a fresh database, register the fake sensors with their rooms
+// the same way the app would, so they stay editable from the app.
+const simDevices = config.simulate ? simulatedDevices(config.simulateSensors) : [];
+if (recorder.managedBy === 'api' && recorder.list().length === 0) {
+  for (const d of simDevices) recorder.add(d.address, d.room);
+}
+const selector = new SensorSelector(recorder.matcher, log, config.debug);
 
 if (config.simulate && config.simulateBackfillDays > 0) {
   simDevices.forEach((device, i) => {

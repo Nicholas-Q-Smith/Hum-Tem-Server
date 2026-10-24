@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Logger } from './logger.js';
-import type { Recorder, TrackedSensor } from './recorder.js';
+import { type Recorder, SensorAdminError, type TrackedSensor } from './recorder.js';
 import type { NearbyDevice } from './sensors.js';
 import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type Store } from './store.js';
 
@@ -54,6 +54,28 @@ export function parseSamplesQuery(params: URLSearchParams): SamplesQuery | { err
   return { from, to, limit: Math.min(MAX_SAMPLES_LIMIT, Math.max(1, limit ?? DEFAULT_SAMPLES_LIMIT)) };
 }
 
+const MAX_BODY_BYTES = 16 * 1024;
+
+class BadRequest extends Error {}
+
+/** Reads a small JSON request body. */
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  const type = req.headers['content-type'] ?? '';
+  if (!/^application\/json\b/i.test(type)) throw new BadRequest('Content-Type must be application/json');
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw new BadRequest('request body too large');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new BadRequest('request body is not valid JSON');
+  }
+}
+
 function send(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
   const json = JSON.stringify(body);
   res.writeHead(status, {
@@ -65,7 +87,7 @@ function send(req: IncomingMessage, res: ServerResponse, status: number, body: u
 }
 
 export function createApiServer({ store, recorder, nearby, version, log }: ApiDeps): Server {
-  return createServer((req, res) => {
+  return createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     /**
      * Resolves `?sensor=` (a MAC address; default: the primary sensor). Sends a
@@ -81,10 +103,40 @@ export function createApiServer({ store, recorder, nearby, version, log }: ApiDe
       }
       return null;
     };
+    const listSensors = () => {
+      const primaryId = recorder.primary()?.id;
+      return {
+        managedBy: recorder.managedBy,
+        sensors: recorder.list().map((s) => recorder.summary(s, primaryId)),
+        nearby: nearby().filter((d) => !recorder.resolve(d.id)),
+      };
+    };
+    const allow = (methods: string) => {
+      res.setHeader('Allow', methods);
+      send(req, res, 405, { error: 'method not allowed' });
+    };
     try {
+      // Sensor management: POST /api/sensors adds one, PATCH /api/sensors/<mac> changes one.
+      if (url.pathname === '/api/sensors' && req.method === 'POST') {
+        const body = (await readJson(req)) as { id?: unknown; room?: unknown } | null;
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BadRequest('body must be a JSON object');
+        const { sensor, created } = recorder.add(body.id, body.room);
+        return send(req, res, created ? 201 : 200, { sensor: recorder.summary(sensor) });
+      }
+      const sensorPath = /^\/api\/sensors\/([^/]+)$/.exec(url.pathname);
+      if (sensorPath) {
+        const id = decodeURIComponent(sensorPath[1]!);
+        if (req.method === 'PATCH') {
+          const sensor = recorder.update(id, await readJson(req));
+          return send(req, res, 200, { sensor: recorder.summary(sensor) });
+        }
+        if (req.method !== 'GET' && req.method !== 'HEAD') return allow('GET, HEAD, PATCH');
+        const sensor = recorder.resolve(id);
+        if (!sensor) return send(req, res, 404, { error: `unknown sensor: ${id}` });
+        return send(req, res, 200, { sensor: recorder.summary(sensor) });
+      }
       if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.setHeader('Allow', 'GET, HEAD');
-        return send(req, res, 405, { error: 'method not allowed' });
+        return allow(url.pathname === '/api/sensors' ? 'GET, HEAD, POST' : 'GET, HEAD');
       }
       switch (url.pathname) {
         case '/api/health': {
@@ -100,13 +152,8 @@ export function createApiServer({ store, recorder, nearby, version, log }: ApiDe
             lastAdvertisement: recorder.lastAdvertisement(),
           });
         }
-        case '/api/sensors': {
-          const primaryId = recorder.primary()?.id;
-          return send(req, res, 200, {
-            sensors: recorder.list().map((s) => recorder.summary(s, primaryId)),
-            nearby: nearby(),
-          });
-        }
+        case '/api/sensors':
+          return send(req, res, 200, listSensors());
         case '/api/latest': {
           const sensor = sensorParam();
           if (sensor === false) return;
@@ -132,6 +179,8 @@ export function createApiServer({ store, recorder, nearby, version, log }: ApiDe
           return send(req, res, 404, { error: 'not found' });
       }
     } catch (err) {
+      if (err instanceof SensorAdminError) return send(req, res, err.status, { error: err.message });
+      if (err instanceof BadRequest) return send(req, res, 400, { error: err.message });
       log.error(`${req.method} ${req.url} failed:`, err);
       if (!res.headersSent) send(req, res, 500, { error: 'internal error' });
       else res.destroy();

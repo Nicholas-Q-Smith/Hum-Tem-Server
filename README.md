@@ -59,14 +59,36 @@ All settings are environment variables. See [.env.example](.env.example).
 
 ### Multiple sensors and rooms
 
-Each H5075 is identified by its MAC address and can be given a room through `SENSORS`. Entries can also be BLE names (`GVH5075_9A2F`) if you don't have the address yet.
+Each H5075 is identified by its MAC address and can be given a room. Sensors are kept in display order, and the **first recording sensor is the primary**. `/api/latest`, `/api/readings` and `/api/samples` default to the primary, so single-sensor clients work unchanged. Pass `?sensor=<MAC>` for another sensor's data.
 
-- **Primary sensor:** the first entry. `/api/latest`, `/api/readings` and `/api/samples` default to it, so the Mac app keeps working unchanged. Pass `?sensor=<MAC>` to get another sensor's data.
-- **Listing:** `GET /api/sensors` lists every sensor in config order, with its room, latest reading, and row counts, which is enough for a dashboard or layout view. It also lists `nearby` H5075s that are heard but not configured, strongest signal first, to help you find the addresses to add.
-- **Adding a sensor:** add an entry and restart. **Renaming a room:** edit its entry and restart.
-- **Removing a sensor from `SENSORS`:** recording stops, but its history stays queryable, and it is listed with `recording: false`.
-- **No `SENSORS` set:** the sensors already in the database keep being recorded. On an empty database, the first `GVH5075_*` heard is adopted and its address is logged.
-- **Upgrading an older single-sensor database:** its history is attached to the primary sensor the first time it's registered.
+**Managed from the app (default, `SENSORS` unset).** The list lives in the database and is edited over the API:
+
+- **List:** `GET /api/sensors` returns the sensors plus `nearby`, the H5075s heard but not added.
+- **Add a nearby sensor:** `POST /api/sensors {"id": "<mac>", "room": "Kitchen"}`.
+- **Change one:** `PATCH /api/sensors/<mac>` with any of:
+  - `{"room": "Office"}` (`null` or `""` clears it)
+  - `{"recording": false}` stops recording but keeps the history; `true` resumes
+  - `{"primary": true}`
+  - `{"position": 2}`
+
+Changes apply immediately and survive restarts. On a fresh database with no sensors, the first `GVH5075_*` heard is recorded automatically, so a single sensor needs no setup at all.
+
+```sh
+curl -X POST localhost:8080/api/sensors -H 'content-type: application/json' -d '{"id":"a4:c1:38:ab:cd:ef","room":"Bedroom"}'
+curl -X PATCH localhost:8080/api/sensors/a4:c1:38:ab:cd:ef -H 'content-type: application/json' -d '{"primary":true}'
+```
+
+To tell which physical sensor is which, hold one in your hand. Its reading in `nearby` (or `latest`) rises within a few seconds.
+
+**Managed by config (`SENSORS` set).** `SENSORS=<mac or BLE name>=<room>;...` is applied on every start:
+
+- **Recording:** the listed sensors record, in the listed order, and every other sensor is set to not recording.
+- **Locked list:** the API answers changes with `409` and `/api/sensors` reports `"managedBy": "config"`. Use this if you'd rather keep the list in a file.
+- **Switching back:** unset `SENSORS`. The sensors keep whatever state config mode left them in; re-enable any you want from the app.
+
+**Upgrading an older single-sensor database:** its history is attached to the first sensor registered after the upgrade.
+
+The API has no authentication, like the rest of pihumtemp, so anyone on the LAN or tailnet can rename or stop sensors. Stopping a sensor never deletes data.
 
 ### Layout
 

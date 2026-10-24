@@ -22,6 +22,18 @@ export interface SensorRecord {
   name: string | null;
   room: string | null;
   firstSeen: number | null;
+  /** Whether new advertisements from it are stored. Off keeps its history. */
+  recording: boolean;
+  /** Display order; the first recording sensor is the primary. */
+  position: number;
+}
+
+export interface SensorUpdate {
+  name?: string;
+  /** null clears the room. */
+  room?: string | null;
+  recording?: boolean;
+  position?: number;
 }
 
 export interface StoreStats {
@@ -67,6 +79,8 @@ interface SensorDbRow {
   first_seen: number | null;
   reading_count: number;
   sample_count: number;
+  recording: number;
+  position: number;
 }
 
 /** Schema migrations, applied in order and tracked with PRAGMA user_version. */
@@ -132,6 +146,10 @@ const MIGRATIONS = [
    DROP TABLE samples;
    ALTER TABLE readings_v3 RENAME TO readings;
    ALTER TABLE samples_v3 RENAME TO samples;`,
+  // v4: sensors are managed at runtime (from the app), not only via SENSORS.
+  `ALTER TABLE sensors ADD COLUMN recording INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE sensors ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+   UPDATE sensors SET position = id;`,
 ];
 
 const round = (v: number, digits: number) => {
@@ -154,7 +172,15 @@ function sampleToReading(row: SampleRow): Reading {
 }
 
 function toSensor(row: SensorDbRow): SensorRecord {
-  return { id: row.id, address: row.address, name: row.name, room: row.room, firstSeen: row.first_seen };
+  return {
+    id: row.id,
+    address: row.address,
+    name: row.name,
+    room: row.room,
+    firstSeen: row.first_seen,
+    recording: row.recording !== 0,
+    position: row.position,
+  };
 }
 
 const emptyStats = (): StoreStats => ({ readings: 0, oldest: null, newest: null, samples: 0 });
@@ -229,7 +255,7 @@ export class Store {
       DELETE FROM samples WHERE sensor_id = @sensor AND ts IN
         (SELECT ts FROM samples WHERE sensor_id = @sensor AND ts < @before ORDER BY ts LIMIT @batch)`);
     this.sensorByAddressStmt = this.db.prepare('SELECT * FROM sensors WHERE address = @address');
-    this.allSensorsStmt = this.db.prepare('SELECT * FROM sensors ORDER BY id');
+    this.allSensorsStmt = this.db.prepare('SELECT * FROM sensors ORDER BY position, id');
     this.bumpCountsStmt = this.db.prepare(
       'UPDATE sensors SET reading_count = reading_count + @readings, sample_count = sample_count + @samples WHERE id = @sensor',
     );
@@ -270,42 +296,66 @@ export class Store {
     return this.allSensorsStmt.all().map(toSensor);
   }
 
+  sensor(id: number): SensorRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM sensors WHERE id = ?').get(id) as SensorDbRow | undefined;
+    return row ? toSensor(row) : undefined;
+  }
+
   /**
-   * Finds or creates the sensor with this address and updates its name/room
-   * (undefined leaves a field unchanged). With `claimLegacy`, a new address
-   * takes over the pre-multi-sensor data (the NULL-address sensor), if any.
+   * Finds or creates the sensor with this address; on creation it goes last in
+   * display order. Fields left undefined are unchanged. With `claimLegacy`, a
+   * new address takes over the pre-multi-sensor data (the NULL-address sensor).
    */
   registerSensor(
     address: string,
-    opts: { name?: string; room?: string; claimLegacy?: boolean; seenAt?: number } = {},
+    opts: SensorUpdate & { claimLegacy?: boolean; seenAt?: number } = {},
   ): SensorRecord {
     return this.db.transaction(() => {
+      const { claimLegacy, seenAt, ...update } = opts;
       const existing = this.sensorByAddressStmt.get({ address });
-      if (existing) {
-        const name = opts.name ?? existing.name;
-        const room = opts.room ?? existing.room;
-        if (name !== existing.name || room !== existing.room) {
-          this.db.prepare('UPDATE sensors SET name = ?, room = ? WHERE id = ?').run(name, room, existing.id);
-        }
-        return toSensor({ ...existing, name, room });
-      }
-      const legacy = opts.claimLegacy
+      if (existing) return this.updateSensor(existing.id, update);
+      const legacy = claimLegacy
         ? (this.db.prepare('SELECT * FROM sensors WHERE address IS NULL ORDER BY id LIMIT 1').get() as
             | SensorDbRow
             | undefined)
         : undefined;
+      let id: number;
       if (legacy) {
-        this.db
-          .prepare('UPDATE sensors SET address = ?, name = COALESCE(?, name), room = COALESCE(?, room) WHERE id = ?')
-          .run(address, opts.name ?? null, opts.room ?? null, legacy.id);
-        return toSensor(this.sensorByAddressStmt.get({ address })!);
+        this.db.prepare('UPDATE sensors SET address = ? WHERE id = ?').run(address, legacy.id);
+        id = legacy.id;
+      } else {
+        const { lastInsertRowid } = this.db
+          .prepare(
+            `INSERT INTO sensors (address, first_seen, position)
+             VALUES (?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM sensors))`,
+          )
+          .run(address, seenAt ?? null);
+        id = Number(lastInsertRowid);
+        this.statsFor(id);
       }
-      const { lastInsertRowid } = this.db
-        .prepare('INSERT INTO sensors (address, name, room, first_seen) VALUES (?, ?, ?, ?)')
-        .run(address, opts.name ?? null, opts.room ?? null, opts.seenAt ?? null);
-      const id = Number(lastInsertRowid);
-      this.statsFor(id);
-      return { id, address, name: opts.name ?? null, room: opts.room ?? null, firstSeen: opts.seenAt ?? null };
+      return this.updateSensor(id, update);
+    })();
+  }
+
+  updateSensor(id: number, update: SensorUpdate): SensorRecord {
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (update.name !== undefined) (sets.push('name = ?'), values.push(update.name));
+    if (update.room !== undefined) (sets.push('room = ?'), values.push(update.room));
+    if (update.recording !== undefined) (sets.push('recording = ?'), values.push(update.recording ? 1 : 0));
+    if (update.position !== undefined) (sets.push('position = ?'), values.push(update.position));
+    if (sets.length) this.db.prepare(`UPDATE sensors SET ${sets.join(', ')} WHERE id = ?`).run(...values, id);
+    const record = this.sensor(id);
+    if (!record) throw new Error(`No sensor with id ${id}`);
+    return record;
+  }
+
+  /** Renumbers display positions to 0..n-1 in the given order (ids not listed keep their relative order after). */
+  reorderSensors(ids: readonly number[]): void {
+    this.db.transaction(() => {
+      const rest = this.allSensorsStmt.all().filter((s) => !ids.includes(s.id)).map((s) => s.id);
+      const set = this.db.prepare('UPDATE sensors SET position = ? WHERE id = ?');
+      [...ids, ...rest].forEach((id, i) => set.run(i, id));
     })();
   }
 

@@ -14,9 +14,13 @@ interface Reading { ts: number; tempC: number; humidity: number; battery?: numbe
 ## Sensors
 
 Several H5075s can be recorded, one per room. A sensor is identified by its MAC address (`a4:c1:38:12:34:56`;
-any case, with `:`/`-` or no separators, is accepted). `/api/latest`, `/api/readings` and `/api/samples` take an
-optional `sensor=<MAC>` parameter. Without it they use the **primary** sensor (the first configured), so
-single-sensor clients work unchanged. An unknown `sensor` returns `404 {"error": "unknown sensor: ..."}`.
+any case, with `:`/`-` or no separators, is accepted). Sensors have a display order; the **primary** is the first
+*recording* sensor in that order. `/api/latest`, `/api/readings` and `/api/samples` take an optional
+`sensor=<MAC>` parameter and default to the primary, so single-sensor clients work unchanged. An unknown `sensor`
+returns `404 {"error": "unknown sensor: ..."}`.
+
+Sensors are managed through the API (`managedBy: "api"`, the default) unless the server's `SENSORS` setting is
+used (`managedBy: "config"`), in which case the write endpoints below answer `409`.
 
 ## `GET /api/health`
 
@@ -32,14 +36,15 @@ the last decoded advertisement from any recorded sensor (or `null` since startup
 
 ## `GET /api/sensors`
 
-Every known sensor in display order (configured order first), plus H5075s heard nearby that aren't configured.
+Every known sensor in display order, plus H5075s heard nearby that haven't been added.
 
 ```json
 {
+  "managedBy": "api",
   "sensors": [
     {
       "id": "a4:c1:38:00:5e:70", "name": "GVH5075_5E70", "room": "Living room",
-      "primary": true, "recording": true, "lastAdvertisement": 1792835578499,
+      "primary": true, "recording": true, "position": 0, "lastAdvertisement": 1792835578499,
       "latest": { "ts": 1792835578499, "tempC": 22.6, "humidity": 41.5, "battery": 61, "rssi": -61 },
       "readings": 43020, "oldest": 1790243520000, "newest": 1792835460000, "samples": 1800
     }
@@ -52,7 +57,37 @@ Every known sensor in display order (configured order first), plus H5075s heard 
 ```
 
 - `name` and `room` may be `null` (name not heard yet, or no room configured).
-- `recording: false` means the sensor has history but is no longer configured.
+- `recording: false` means the sensor is kept (with its history) but new readings aren't stored.
+- `position` is the index in display order (0 = first).
+- `nearby` entries disappear after 10 minutes unheard. Add one with `POST /api/sensors`.
+
+`GET /api/sensors/<MAC>` returns `{ "sensor": <same shape> }` for one sensor.
+
+## `POST /api/sensors`
+
+Start recording a sensor, typically one from `nearby`. Body (`Content-Type: application/json`):
+
+```json
+{ "id": "a4:c1:38:9f:01:23", "room": "Kitchen" }
+```
+
+`room` is optional. Returns `201 { "sensor": ... }` if it was new, or `200` if it already existed (it is then
+set to recording, and its room updated if given). Errors: `400` (not a MAC address, bad room), `409` (managed by config).
+
+## `PATCH /api/sensors/<MAC>`
+
+Change a sensor. Body: any of
+
+| field | |
+|---|---|
+| `room` | string up to 64 characters; `null` or `""` clears it |
+| `recording` | `false` stops storing readings (history is kept); `true` resumes |
+| `primary` | `true` moves it to the front of the order |
+| `position` | integer ≥ 0; moves it to that index (clamped to the end) |
+
+Returns `200 { "sensor": ... }`. Changes apply immediately and persist. Errors: `400` (unknown field, bad value,
+empty body, not JSON), `404` (unknown sensor), `409` (managed by config). A sensor's MAC in the path may be
+URL-encoded (`a4%3Ac1%3A...`) or written plainly.
 - `latest` is the live reading, or the newest minute row before the sensor is heard after a restart, or `null`.
 
 ## `GET /api/latest[?sensor=<MAC>]`

@@ -86,11 +86,17 @@ export function parseSensorsSpec(spec: string): SensorSpec[] {
 }
 
 /**
- * Picks the sensors to record out of the advertisement stream and decodes them.
- *
- * - With specs: records exactly those (matched by address, or by local name).
- * - Without specs ("auto"): records the sensors in `known` (already in the
- *   database); if there are none, adopts the first GVH5075_* heard.
+ * What to do with a device: record it (optionally under a configured spec),
+ * ignore it because it's known but not recording, or undefined for a device
+ * that isn't known at all (it's then listed as nearby).
+ */
+export type Decision = { record: true; spec?: SensorSpec } | 'ignore' | undefined;
+export type SensorMatcher = (key: string, name: string | undefined) => Decision;
+
+/**
+ * Picks the sensors to record out of the advertisement stream and decodes
+ * them. Which ones to record is decided by `matcher` (the Recorder) on every
+ * packet, so sensors added or stopped at runtime take effect immediately.
  *
  * The H5075 often sends its name (scan response) and its data (advertisement)
  * in separate packets, so names are remembered per device.
@@ -99,23 +105,12 @@ export class SensorSelector {
   private readonly names = new Map<string, string>();
   private readonly last = new Map<string, Sample>();
   private readonly nearbyDevices = new Map<string, NearbyDevice>();
-  private readonly known: Set<string>;
 
   constructor(
-    private readonly specs: readonly SensorSpec[],
-    known: Iterable<string>,
+    private readonly matcher: SensorMatcher,
     private readonly log: Logger,
     private readonly debugRaw = false,
-  ) {
-    this.known = new Set(known);
-    if (specs.length) {
-      log.info(`Recording ${specs.length} sensor(s): ${specs.map(describeSpec).join(', ')}`);
-    } else if (this.known.size) {
-      log.info(`No SENSORS configured; recording the sensor(s) already in the database: ${[...this.known].join(', ')}`);
-    } else {
-      log.info(`No SENSORS configured; will record the first ${H5075_NAME_PREFIX}_* heard`);
-    }
-  }
+  ) {}
 
   handle(adv: Advertisement): Match | null {
     const key = deviceKey(adv);
@@ -131,9 +126,9 @@ export class SensorSelector {
     }
     if (!govee) return null;
 
-    const matched = this.match(key, name);
-    if (!matched) {
-      if (name?.startsWith(`${H5075_NAME_PREFIX}_`)) {
+    const decision = this.matcher(key, name);
+    if (decision === undefined || decision === 'ignore') {
+      if (decision === undefined && name?.startsWith(`${H5075_NAME_PREFIX}_`)) {
         this.nearbyDevices.set(key, {
           id: key,
           name,
@@ -141,9 +136,12 @@ export class SensorSelector {
           lastSeen: adv.receivedAt,
           reading: decodeH5075(adv.manufacturerData),
         });
+      } else {
+        this.nearbyDevices.delete(key);
       }
       return null;
     }
+    this.nearbyDevices.delete(key);
 
     const reading = decodeH5075(adv.manufacturerData);
     if (!reading) {
@@ -163,32 +161,21 @@ export class SensorSelector {
       return null;
     }
     this.last.set(key, sample);
-    return { sample, spec: matched === true ? undefined : matched, name };
+    return { sample, spec: decision.spec, name };
   }
 
-  /** H5075s heard recently that aren't being recorded, strongest first (to help fill in SENSORS). */
+  /** H5075s heard recently that aren't known sensors, strongest first (candidates to add). */
   nearby(now = Date.now()): NearbyDevice[] {
     for (const [k, d] of this.nearbyDevices) if (now - d.lastSeen > NEARBY_TTL_MS) this.nearbyDevices.delete(k);
     return [...this.nearbyDevices.values()].sort((a, b) => b.rssi - a.rssi);
   }
 
-  /** The spec it matches, `true` for an auto-mode sensor, or undefined. */
-  private match(key: string, name: string | undefined): SensorSpec | true | undefined {
-    if (this.specs.length) {
-      const lower = name?.toLowerCase();
-      return this.specs.find((s) => (s.address ? s.address === key : lower !== undefined && s.name!.toLowerCase() === lower));
-    }
-    if (this.known.has(key)) return true;
-    if (this.known.size === 0 && name?.startsWith(`${H5075_NAME_PREFIX}_`)) {
-      this.known.add(key);
-      this.nearbyDevices.delete(key);
-      this.log.info(`Recording sensor ${name} (${key}). Add it to SENSORS (e.g. SENSORS=${key}=Living room) to name its room.`);
-      return true;
-    }
-    return undefined;
+  /** Stop listing a device as nearby (e.g. once it's been added). */
+  forgetNearby(key: string): void {
+    this.nearbyDevices.delete(key);
   }
 }
 
-function describeSpec(s: SensorSpec): string {
+export function describeSpec(s: SensorSpec): string {
   return `${s.address ?? s.name}${s.room ? ` (${s.room})` : ''}`;
 }
