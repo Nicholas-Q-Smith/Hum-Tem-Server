@@ -1,0 +1,36 @@
+[Unit]
+Description=pihumtemp - Govee H5075 BLE recorder and HTTP API
+Documentation=file:///opt/pihumtemp/README.md
+After=bluetooth.target network-online.target time-sync.target
+Wants=bluetooth.target network-online.target
+# Keep retrying forever: this is meant to record indefinitely.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pihumtemp
+Group=pihumtemp
+SupplementaryGroups=bluetooth
+WorkingDirectory=/opt/pihumtemp
+EnvironmentFile=-/etc/default/pihumtemp
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/pihumtemp/dist/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Raw HCI access for noble without root and without setcap on the node binary.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Creates /var/lib/pihumtemp owned by the service user.
+StateDirectory=pihumtemp
+StateDirectoryMode=0750
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
