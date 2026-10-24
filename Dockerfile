@@ -27,14 +27,17 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
+COPY deploy/docker-entrypoint.sh /usr/local/bin/pihumtemp-entrypoint
 
 ENV NODE_ENV=production \
     PORT=8080 \
     DB_PATH=/var/lib/pihumtemp/pihumtemp.db
 # The database lives here; mount a volume or host directory to persist it.
 VOLUME ["/var/lib/pihumtemp"]
-USER node
+# No USER: the entrypoint fixes the data directory's ownership as root, then
+# runs the server as `node`.
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+ENTRYPOINT ["pihumtemp-entrypoint"]
 CMD ["node", "dist/index.js"]

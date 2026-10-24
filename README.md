@@ -180,7 +180,6 @@ This replaces step 2: use either `install.sh` (systemd) or Docker, not both. Hos
 sudo apt-get install -y bluetooth bluez sqlite3      # host BlueZ owns the adapter; sqlite3 for backups
 curl -fsSL https://get.docker.com | sh               # Docker Engine + compose plugin
 sudo usermod -aG docker $USER && newgrp docker
-sudo install -d -o 1000 -g 1000 -m 0750 /var/lib/pihumtemp   # the container runs as uid 1000 (node)
 
 # Get the code
 git clone https://github.com/Nicholas-Q-Smith/Hum-Tem-Server.git ~/pihumtemp
@@ -195,12 +194,12 @@ curl http://localhost:8080/api/health
 
 **Persistence:** the database is bind-mounted from the host at `/var/lib/pihumtemp`, the same path the systemd install uses. Rebuilding the image, `docker compose down` (even with `-v`), or deleting the checkout leaves the data alone. SQLite's `-wal`/`-shm` files sit next to the database in the same directory, so the host's `sqlite3 .backup` (step 5, run as root or uid 1000) is safe while the container runs.
 
-If you're switching from the systemd install, run `sudo systemctl disable --now pihumtemp`, then `sudo chown -R 1000:1000 /var/lib/pihumtemp`.
+If you're switching from the systemd install, run `sudo systemctl disable --now pihumtemp` first, so the two don't compete for Bluetooth and port 8080. The container takes over the existing database and fixes its ownership itself.
 
 How the container gets at Bluetooth:
 
 - **Host networking:** `network_mode: host` is required because Linux Bluetooth sockets exist only in the host network namespace. As a result, port 8080 is the host's port, reachable over the LAN and `tailscale0` with no port mapping.
-- **Raw sockets without root:** the image gives the node binary `cap_net_raw`, and compose keeps `NET_RAW` in the container. The process runs as the unprivileged `node` user.
+- **Raw sockets without root:** the image gives the node binary `cap_net_raw`, and compose keeps `NET_RAW` in the container. The entrypoint starts as root only to make `/var/lib/pihumtemp` owned by the `node` user (uid 1000), since Docker creates a missing bind-mount folder as root, then runs the server as `node`.
 - **Restarts and logs:** `restart: unless-stopped` brings the container back after crashes and reboots. Log size is capped at 3 × 10 MB to spare the SD card.
 
 To try the container on a Mac, where there's no Bluetooth, use `docker compose -f compose.yaml -f compose.simulate.yaml up --build`. That runs simulate mode on `localhost:8080`, with a named volume for the database.
@@ -256,4 +255,5 @@ This keeps two weeks of daily snapshots. Copy them off the SD card now and then 
   - Run `rfkill list` to check that Bluetooth isn't soft-blocked.
   - Check that the sensor is within range (RSSI better than about −90).
 - **`EPERM`/`EACCES` from noble when run by hand:** the setcap above is missing, or was lost in a Node upgrade.
+- **Port 8080 refuses connections:** the server isn't running. Check `docker compose ps -a` and `docker compose logs --tail 50` (or `journalctl -u pihumtemp`). A Bluetooth problem no longer stops the API; it shows up in `/api/health` under `bluetooth`.
 - **Native module build errors in `npm ci`:** make sure `build-essential`, `libbluetooth-dev` and `libudev-dev` are installed. `install.sh` installs them.
