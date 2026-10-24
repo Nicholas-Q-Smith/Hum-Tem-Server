@@ -7,7 +7,7 @@ import { MinuteAggregator, type MinuteRow } from '../src/aggregator.js';
 import { encodeH5075 } from '../src/govee/h5075.js';
 import { createLogger } from '../src/logger.js';
 import { SensorSelector, type Sample } from '../src/sensors.js';
-import { parseSamplesQuery } from '../src/server.js';
+import { parseSamplesQuery, withPending } from '../src/server.js';
 import { Store } from '../src/store.js';
 
 const T0 = Date.UTC(2026, 0, 1);
@@ -137,6 +137,51 @@ describe('MinuteAggregator raw samples', () => {
       [T0, 2, [a, b]],
       [T0 + 60_000, 1, [c]],
     ]);
+  });
+});
+
+describe('pending (unflushed) samples', () => {
+  it('holds the open minute until it is flushed', () => {
+    const agg = new MinuteAggregator(() => {});
+    const a = sample(T0 + 1_000);
+    const b = sample(T0 + 3_000);
+    agg.add(a);
+    agg.add(b);
+    expect(agg.pending()).toEqual([a, b]);
+    agg.add(sample(T0 + 61_000)); // closes the first minute
+    expect(agg.pending().map((s) => s.ts)).toEqual([T0 + 61_000]);
+  });
+
+  const stored = (...ts: number[]) => ts.map((t) => ({ ts: t, tempC: 21, humidity: 45 }));
+  const q = { from: T0, to: T0 + 120_000, limit: 10 };
+
+  it('appends unflushed samples after the stored ones', () => {
+    const page = withPending({ readings: stored(T0 + 1_000, T0 + 3_000), next: null }, [sample(T0 + 61_000), sample(T0 + 63_000)], q);
+    expect(page.readings.map((r) => r.ts)).toEqual([T0 + 1_000, T0 + 3_000, T0 + 61_000, T0 + 63_000]);
+    expect(page.next).toBeNull();
+  });
+
+  it('leaves a page that is not the last one alone', () => {
+    const page = { readings: stored(T0 + 1_000), next: T0 + 1_001 };
+    expect(withPending(page, [sample(T0 + 61_000)], q)).toBe(page);
+  });
+
+  it('respects the range and never repeats a stored sample', () => {
+    const page = withPending(
+      { readings: stored(T0 + 61_000), next: null },
+      [sample(T0 + 61_000), sample(T0 + 62_000), sample(T0 + 130_000)],
+      q,
+    );
+    expect(page.readings.map((r) => r.ts)).toEqual([T0 + 61_000, T0 + 62_000]);
+  });
+
+  it('pages past the limit', () => {
+    const pending = Array.from({ length: 5 }, (_, i) => sample(T0 + 60_000 + i * 2_000));
+    const page = withPending({ readings: [], next: null }, pending, { ...q, limit: 3 });
+    expect(page.readings).toHaveLength(3);
+    expect(page.next).toBe(T0 + 64_001);
+    const rest = withPending({ readings: [], next: null }, pending, { ...q, from: page.next!, limit: 3 });
+    expect(rest.readings.map((r) => r.ts)).toEqual([T0 + 66_000, T0 + 68_000]);
   });
 });
 

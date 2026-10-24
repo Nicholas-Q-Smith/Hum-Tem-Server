@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Logger } from './logger.js';
 import { type Recorder, SensorAdminError, type TrackedSensor } from './recorder.js';
-import type { NearbyDevice } from './sensors.js';
-import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type Store } from './store.js';
+import type { NearbyDevice, Sample } from './sensors.js';
+import { MAX_POINTS_LIMIT, MAX_SAMPLES_LIMIT, type SamplePage, type Store } from './store.js';
 
 export interface ApiDeps {
   store: Store;
@@ -74,6 +74,24 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   } catch {
     throw new BadRequest('request body is not valid JSON');
   }
+}
+
+/**
+ * Raw samples are stored when their minute closes, so the stored page ends up to a
+ * minute behind. Once the page has reached the end of what's stored, add the
+ * in-memory samples of the still-open minute so clients see readings within seconds.
+ */
+export function withPending(page: SamplePage, pending: readonly Sample[], { from, to, limit }: SamplesQuery): SamplePage {
+  if (page.next !== null) return page;
+  const after = page.readings.at(-1)?.ts ?? from - 1;
+  const extra = pending
+    .filter((s) => s.ts >= from && s.ts <= to && s.ts > after)
+    .map((s) => ({ ts: s.ts, tempC: s.tempC, humidity: s.humidity, battery: s.battery, rssi: s.rssi }));
+  if (extra.length === 0) return page;
+  const readings = [...page.readings, ...extra];
+  if (readings.length <= limit) return { readings, next: null };
+  const kept = readings.slice(0, limit);
+  return { readings: kept, next: kept.at(-1)!.ts + 1 };
 }
 
 function send(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
@@ -173,7 +191,9 @@ export function createApiServer({ store, recorder, nearby, version, log }: ApiDe
           if ('error' in q) return send(req, res, 400, { error: q.error });
           const sensor = sensorParam();
           if (sensor === false) return;
-          return send(req, res, 200, sensor ? store.samples(sensor.record.id, q.from, q.to, q.limit) : { readings: [], next: null });
+          if (!sensor) return send(req, res, 200, { readings: [], next: null });
+          const page = store.samples(sensor.record.id, q.from, q.to, q.limit);
+          return send(req, res, 200, withPending(page, sensor.aggregator.pending(), q));
         }
         default:
           return send(req, res, 404, { error: 'not found' });

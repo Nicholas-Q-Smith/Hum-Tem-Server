@@ -109,7 +109,7 @@ The most recent raw sample (updated every ~2 s). After a restart, before the fir
 - If the range holds ≤ `maxPoints` rows, they are returned as-is (one per minute).
 - Otherwise `[from, to]` is split into `maxPoints` equal buckets of `ceil((to - from + 1) / maxPoints)` ms. One averaged reading is returned per **non-empty** bucket with `ts` = bucket start (`from + i * bucketMs`). Empty buckets are left out, so the client can draw gaps where data is missing.
 
-## `GET /api/samples?from=<ms>&to=<ms>&limit=<n>[&sensor=<MAC>]` (additive; not used by the Mac app yet)
+## `GET /api/samples?from=<ms>&to=<ms>&limit=<n>[&sensor=<MAC>]`
 
 Raw samples: every decoded advertisement (about one every 2 s), with its exact receive time.
 
@@ -120,6 +120,6 @@ Raw samples: every decoded advertisement (about one every 2 s), with its exact r
 - Oldest first, `from <= ts <= to`. `from` and `to` are required integers with `from <= to`.
 - `limit` is clamped to 1..50000 (default 10000). One day is about 43,200 samples.
 - If more samples remain in the range, `next` is the `from` to use for the next page; otherwise it is `null`.
-- Values have the sensor's 0.1 resolution. Samples are written once their minute closes, so the newest
-  minute appears up to ~1 min late; use `/api/latest` for the live value.
+- Values have the sensor's 0.1 resolution. Samples are stored once their minute closes; the current,
+  still-open minute's samples are served from memory, so results are current to within seconds.
 - Samples older than `RAW_RETENTION_DAYS` (if set) are deleted; `/api/readings` minute rows are kept forever.

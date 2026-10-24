@@ -77,6 +77,11 @@ export class MinuteAggregator {
     return keys.length;
   }
 
+  /** Samples of minutes not flushed yet (normally just the current one), oldest first. */
+  pending(): Sample[] {
+    return [...this.buckets.keys()].sort((a, b) => a - b).flatMap((key) => this.buckets.get(key)!.samples);
+  }
+
   private emit(key: number): void {
     const acc = this.buckets.get(key)!;
     this.buckets.delete(key);
